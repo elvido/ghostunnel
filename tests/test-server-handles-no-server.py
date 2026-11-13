@@ -4,38 +4,28 @@
 Ensures that client gets a timeout if there is no server.
 """
 
-from common import LOCALHOST, RootCert, STATUS_PORT, SocketPair, TcpServer, TlsClient, print_ok, run_ghostunnel, terminate
-import socket
+from common import SocketPair, TcpServer, TlsClient, print_ok, terminate, LISTEN_PORT, TARGET_PORT, create_default_certs, start_ghostunnel_server, get_free_port
 
-if __name__ == "__main__":
-    ghostunnel = None
+ghostunnel = None
+root = None
+try:
+    root = create_default_certs()
+    ghostunnel = start_ghostunnel_server()
+
+    # client should fail to connect since nothing is listening on wrong_port
+    wrong_port = get_free_port()
     try:
-        # create certs
-        root = RootCert('root')
-        root.create_signed_cert('server')
-        root.create_signed_cert('client')
+        SocketPair(
+            TlsClient('client', 'root', LISTEN_PORT), TcpServer(wrong_port))
+        raise Exception('client should have failed to connect')
+    except TimeoutError:
+        print_ok("timeout when nothing is listening on {0}".format(wrong_port))
 
-        # start ghostunnel
-        ghostunnel = run_ghostunnel(['server',
-                                     '--listen={0}:13001'.format(LOCALHOST),
-                                     '--target={0}:13002'.format(LOCALHOST),
-                                     '--keystore=server.p12',
-                                     '--status={0}:{1}'.format(LOCALHOST,
-                                                               STATUS_PORT),
-                                     '--cacert=root.crt',
-                                     '--allow-ou=client'])
-
-        # client should fail to connect since nothing is listening on 13003
-        try:
-            pair = SocketPair(
-                TlsClient('client', 'root', 13001), TcpServer(13003))
-            raise Exception('client should have failed to connect')
-        except socket.timeout:
-            print_ok("timeout when nothing is listening on 13003")
-
-        # client should connect
-        pair = SocketPair(TlsClient('client', 'root', 13001), TcpServer(13002))
-        pair.cleanup()
-        print_ok("OK")
-    finally:
-        terminate(ghostunnel)
+    # client should connect
+    pair = SocketPair(TlsClient('client', 'root', LISTEN_PORT), TcpServer(TARGET_PORT))
+    pair.cleanup()
+    print_ok("OK")
+finally:
+    terminate(ghostunnel)
+    if root:
+        root.cleanup()

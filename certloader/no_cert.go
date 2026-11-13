@@ -19,15 +19,15 @@ package certloader
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"fmt"
 	"sync/atomic"
-	"unsafe"
 )
 
 type trustBundle struct {
 	// Root CA bundle path
 	caBundlePath string
 	// Cached *x509.CertPool
-	cachedCertPool unsafe.Pointer
+	cachedCertPool atomic.Pointer[x509.CertPool]
 }
 
 // NoCertificate creates an empty certificate with only a trust bundle.
@@ -46,11 +46,16 @@ func NoCertificate(caBundlePath string) (Certificate, error) {
 func (c *trustBundle) Reload() error {
 	bundle, err := LoadTrustStore(c.caBundlePath)
 	if err != nil {
-		return err
+		return fmt.Errorf("loading trust store: %w", err)
 	}
 
-	atomic.StorePointer(&c.cachedCertPool, unsafe.Pointer(bundle))
+	c.cachedCertPool.Store(bundle)
 	return nil
+}
+
+// GetIdentifier returns an identifier for the certificate for logging.
+func (c *trustBundle) GetIdentifier() string {
+	return ""
 }
 
 // GetCertificate retrieves the actual underlying tls.Certificate.
@@ -65,5 +70,5 @@ func (c *trustBundle) GetClientCertificate(certInfo *tls.CertificateRequestInfo)
 
 // GetTrustStore returns the most up-to-date version of the trust store / CA bundle.
 func (c *trustBundle) GetTrustStore() *x509.CertPool {
-	return (*x509.CertPool)(atomic.LoadPointer(&c.cachedCertPool))
+	return c.cachedCertPool.Load()
 }

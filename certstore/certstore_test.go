@@ -1,3 +1,5 @@
+//go:build cgo && (darwin || windows)
+
 package certstore
 
 import (
@@ -9,9 +11,8 @@ import (
 	"crypto/sha256"
 	"crypto/sha512"
 	"crypto/x509"
+	"errors"
 	"testing"
-
-	"github.com/github/fakeca"
 )
 
 func TestImportDeleteRSA(t *testing.T) {
@@ -23,7 +24,8 @@ func TestImportDeleteECDSA(t *testing.T) {
 }
 
 // ImportDeleteHelper is an abstraction for testing identity Import()/Delete().
-func ImportDeleteHelper(t *testing.T, i *fakeca.Identity) {
+func ImportDeleteHelper(t *testing.T, i *identity) {
+	t.Helper()
 	withStore(t, func(store Store) {
 		// Import an identity
 		if err := store.Import(i.PFX("asdf"), "asdf"); err != nil {
@@ -129,7 +131,7 @@ func TestSignerRSA(t *testing.T) {
 		// SHA256WithRSA
 		sha256Digest := sha256.Sum256([]byte("hello"))
 		sig, err = signer.Sign(rand.Reader, sha256Digest[:], crypto.SHA256)
-		if err == ErrUnsupportedHash {
+		if errors.Is(err, ErrUnsupportedHash) {
 			// Some Windows CSPs may not support this algorithm. Pass...
 		} else if err != nil {
 			t.Fatal(err)
@@ -142,7 +144,7 @@ func TestSignerRSA(t *testing.T) {
 		// SHA256WithRSAPSS
 		sha256Digest = sha256.Sum256([]byte("hello"))
 		sig, err = signer.Sign(rand.Reader, sha256Digest[:], &rsa.PSSOptions{Hash: crypto.SHA256})
-		if err == ErrUnsupportedHash {
+		if errors.Is(err, ErrUnsupportedHash) {
 			// Some Windows CSPs may not support this algorithm. Pass...
 		} else if err != nil {
 			t.Fatal(err)
@@ -155,7 +157,7 @@ func TestSignerRSA(t *testing.T) {
 		// SHA384WithRSA
 		sha384Digest := sha512.Sum384([]byte("hello"))
 		sig, err = signer.Sign(rand.Reader, sha384Digest[:], crypto.SHA384)
-		if err == ErrUnsupportedHash {
+		if errors.Is(err, ErrUnsupportedHash) {
 			// Some Windows CSPs may not support this algorithm. Pass...
 		} else if err != nil {
 			t.Fatal(err)
@@ -168,7 +170,7 @@ func TestSignerRSA(t *testing.T) {
 		// SHA384WithRSAPSS
 		sha384Digest = sha512.Sum384([]byte("hello"))
 		sig, err = signer.Sign(rand.Reader, sha384Digest[:], &rsa.PSSOptions{Hash: crypto.SHA384})
-		if err == ErrUnsupportedHash {
+		if errors.Is(err, ErrUnsupportedHash) {
 			// Some Windows CSPs may not support this algorithm. Pass...
 		} else if err != nil {
 			t.Fatal(err)
@@ -181,7 +183,7 @@ func TestSignerRSA(t *testing.T) {
 		// SHA512WithRSA
 		sha512Digest := sha512.Sum512([]byte("hello"))
 		sig, err = signer.Sign(rand.Reader, sha512Digest[:], crypto.SHA512)
-		if err == ErrUnsupportedHash {
+		if errors.Is(err, ErrUnsupportedHash) {
 			// Some Windows CSPs may not support this algorithm. Pass...
 		} else if err != nil {
 			t.Fatal(err)
@@ -194,7 +196,7 @@ func TestSignerRSA(t *testing.T) {
 		// SHA512WithRSAPSS
 		sha512Digest = sha512.Sum512([]byte("hello"))
 		sig, err = signer.Sign(rand.Reader, sha512Digest[:], &rsa.PSSOptions{Hash: crypto.SHA512})
-		if err == ErrUnsupportedHash {
+		if errors.Is(err, ErrUnsupportedHash) {
 			// Some Windows CSPs may not support this algorithm. Pass...
 		} else if err != nil {
 			t.Fatal(err)
@@ -213,7 +215,7 @@ func TestSignerRSA(t *testing.T) {
 		// Unsupported hash
 		sha224Digest := sha256.Sum224([]byte("hello"))
 		_, err = signer.Sign(rand.Reader, sha224Digest[:], crypto.SHA224)
-		if err != ErrUnsupportedHash {
+		if !errors.Is(err, ErrUnsupportedHash) {
 			t.Fatal("expected ErrUnsupportedHash, got ", err)
 		}
 	})
@@ -237,12 +239,8 @@ func TestSignerECDSA(t *testing.T) {
 			t.Fatal("expected pk to be an RSA public key")
 		}
 
-		if ecPub.X.Cmp(ecPriv.X) != 0 {
-			t.Fatalf("bad X. Got %s, expected %s", ecPub.X.Text(16), ecPriv.X.Text(16))
-		}
-
-		if ecPub.Y.Cmp(ecPriv.Y) != 0 {
-			t.Fatalf("bad Y. Got %s, expected %s", ecPub.Y.Text(16), ecPriv.Y.Text(16))
+		if !ecPub.Equal(&ecPriv.PublicKey) {
+			t.Fatal("signer public key does not match private key")
 		}
 
 		// ECDSAWithSHA1
@@ -293,6 +291,24 @@ func TestSignerECDSA(t *testing.T) {
 	})
 }
 
+func TestStoreClose(t *testing.T) {
+	withStore(t, func(store Store) {
+		// Close should not panic
+		store.Close()
+	})
+}
+
+func TestImportWrongPFXPassword(t *testing.T) {
+	withStore(t, func(store Store) {
+		pfx := leafRSA.PFX("correctpassword")
+
+		err := store.Import(pfx, "wrongpassword")
+		if err == nil {
+			t.Fatal("expected non-nil error importing PFX with wrong password")
+		}
+	})
+}
+
 func TestCertificateRSA(t *testing.T) {
 	CertificateHelper(t, leafRSA)
 }
@@ -301,7 +317,8 @@ func TestCertificateEC(t *testing.T) {
 	CertificateHelper(t, leafEC)
 }
 
-func CertificateHelper(t *testing.T, leaf *fakeca.Identity) {
+func CertificateHelper(t *testing.T, leaf *identity) {
+	t.Helper()
 	withIdentity(t, root, func(caIdent Identity) {
 		withIdentity(t, intermediate, func(interIdent Identity) {
 			withIdentity(t, leaf, func(leafIdent Identity) {

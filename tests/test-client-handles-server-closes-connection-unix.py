@@ -4,35 +4,45 @@
 Ensures when server disconnects that the client connection also disconnects, with UNIX sockets.
 """
 
-from common import LOCALHOST, RootCert, STATUS_PORT, SocketPair, UnixClient, TlsServer, print_ok, run_ghostunnel, terminate
+from common import LOCALHOST, RootCert, STATUS_PORT, SocketPair, UnixClient, TlsServer, print_ok, run_ghostunnel, require_platform, terminate, TARGET_PORT
 
-if __name__ == "__main__":
-    ghostunnel = None
-    try:
-        # create certs
-        root = RootCert('root')
-        root.create_signed_cert('server')
-        root.create_signed_cert('client')
+require_platform('Darwin', 'Linux', 'BSD')
 
-        # start ghostunnel
-        client = UnixClient()
-        ghostunnel = run_ghostunnel(['client',
-                                     '--listen=unix:{0}'.format(client.get_socket_path()),
-                                     '--target={0}:13002'.format(LOCALHOST),
-                                     '--keystore=client.p12',
-                                     '--status={0}:{1}'.format(LOCALHOST,
-                                                               STATUS_PORT),
-                                     '--cacert=root.crt'])
+ghostunnel = None
+try:
+    # create certs
+    root = RootCert('root')
+    root.create_signed_cert('server')
+    root.create_signed_cert('client')
 
-        # connect with client, confirm that the tunnel is up
-        pair = SocketPair(client, TlsServer('server', 'root', 13002))
-        pair.validate_can_send_from_server(
-            "hello world", "1: server -> client")
-        pair.validate_can_send_from_client(
-            "hello world", "1: client -> server")
-        pair.validate_closing_server_closes_client(
-            "1: server closed -> client closed")
+    # start ghostunnel
+    client = UnixClient()
+    ghostunnel = run_ghostunnel(['client',
+                                 '--listen=unix:{0}'.format(client.get_socket_path()),
+                                 '--target={0}:{1}'.format(LOCALHOST, TARGET_PORT),
+                                 '--keystore=client.p12',
+                                 '--status={0}:{1}'.format(LOCALHOST,
+                                                           STATUS_PORT),
+                                 '--close-timeout=10s',
+                                 '--cacert=root.crt'])
 
-        print_ok("OK")
-    finally:
-        terminate(ghostunnel)
+    # connect with client, confirm that the tunnel is up
+    pair = SocketPair(client, TlsServer('server', 'root', TARGET_PORT))
+    pair.validate_can_send_from_server(
+        "hello world", "1: server -> client")
+    pair.validate_can_send_from_client(
+        "hello world", "1: client -> server")
+    pair.validate_closing_server_closes_client(
+        "1: server closed -> client closed")
+
+    pair = SocketPair(client, TlsServer('server', 'root', TARGET_PORT))
+    pair.validate_can_send_from_server(
+        "hello world", "2: server -> client")
+    pair.validate_can_send_from_client(
+        "hello world", "2: client -> server")
+    pair.validate_half_closing_server_closes_client(
+        "2: server closed -> client closed")
+
+    print_ok("OK")
+finally:
+    terminate(ghostunnel)

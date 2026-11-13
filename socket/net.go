@@ -24,11 +24,11 @@ import (
 )
 
 // ParseAddress parses a string representing a TCP address or UNIX socket
-// for our backend target. The input can be or the form "HOST:PORT" for
+// for our backend target. The input can be of the form "HOST:PORT" for
 // a TCP socket, "unix:PATH" for a UNIX socket, and "systemd:NAME" or
 // "launchd:NAME" for a socket provided by launchd/systemd for socket
 // activation.
-func ParseAddress(input string) (network, address, host string, err error) {
+func ParseAddress(input string, skipResolve bool) (network, address, host string, err error) {
 	if strings.HasPrefix(input, "launchd:") {
 		network = "launchd"
 		address = input[8:]
@@ -52,14 +52,20 @@ func ParseAddress(input string) (network, address, host string, err error) {
 		return
 	}
 
-	// Make sure target address resolves
-	_, err = net.ResolveTCPAddr("tcp", input)
-	if err != nil {
-		return
+	network, address = "tcp", input
+	if !skipResolve {
+		// Make sure target address resolves, unless requested otherwise.
+		_, err = net.ResolveTCPAddr("tcp", input)
 	}
 
-	network, address = "tcp", input
 	return
+}
+
+// IsDialableNetwork reports whether the network returned by ParseAddress
+// can be opened by net.Dialer. The "systemd" and "launchd" networks are
+// listen-only schemes for socket activation and cannot be dialed.
+func IsDialableNetwork(network string) bool {
+	return network == "tcp" || network == "unix"
 }
 
 // ParseHTTPAddress parses a string representing a TCP address or HTTP/HTTPS address
@@ -90,7 +96,7 @@ func ParseHTTPAddress(input string) (https bool, address string) {
 // will be set to unlink on close automatically.
 //
 // For 'launchd' sockets, the address must be the name of the socket
-// from the plist file. Only one socket maybe configured in the
+// from the plist file. Only one socket may be configured in the
 // plist for that name, multiple sockets per name (e.g. separate
 // IPv4/IPv4 sockets) are not supported.
 //
@@ -108,7 +114,11 @@ func Open(network, address string) (net.Listener, error) {
 		if err != nil {
 			return nil, err
 		}
-		listener.(*net.UnixListener).SetUnlinkOnClose(true)
+		// net.Listen on a unix network always returns a *net.UnixListener; the
+		// check is defensive so a future/unexpected type degrades gracefully.
+		if unixListener, ok := listener.(*net.UnixListener); ok {
+			unixListener.SetUnlinkOnClose(true)
+		}
 		return listener, nil
 	default:
 		return reuseport.NewReusablePortListener(network, address)
@@ -117,7 +127,7 @@ func Open(network, address string) (net.Listener, error) {
 
 // ParseAndOpen combines the functionality of the ParseAddress and Open methods.
 func ParseAndOpen(address string) (net.Listener, error) {
-	net, addr, _, err := ParseAddress(address)
+	net, addr, _, err := ParseAddress(address, false)
 	if err != nil {
 		return nil, err
 	}

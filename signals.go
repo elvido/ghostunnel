@@ -17,9 +17,10 @@
 package main
 
 import (
-	ctx "context"
+	"context"
 	"os"
 	"os/signal"
+	"slices"
 	"time"
 
 	"github.com/ghostunnel/ghostunnel/proxy"
@@ -29,67 +30,124 @@ import (
 // and returns true if that's the case. Returns false if the signal is
 // a refresh signal.
 func isShutdownSignal(sig os.Signal) bool {
-	for _, shutdownSignal := range shutdownSignals {
-		if sig == shutdownSignal {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(shutdownSignals, sig)
 }
 
 // signalHandler listens for incoming shutdown or refresh signals. If we get
 // a shutdown signal, we stop listening for new connections and gracefully
 // terminate the process. If we get a refresh signal, reload certificates.
-func (context *Context) signalHandler(p *proxy.Proxy) {
+func (env *Environment) signalHandler(p *proxy.Proxy) {
 	signals := make(chan os.Signal, 3)
 	signal.Notify(signals, append(shutdownSignals, refreshSignals...)...)
-	defer signal.Stop(signals)
+
+	shutdownFunc := func() {
+		// Stop delivering signals to our channel and make sure refresh signals
+		// (SIGHUP/SIGUSR1) don't revert to their default disposition (terminate)
+		// while we drain in-flight connections in p.Wait(). Ignore them instead.
+		signal.Stop(signals)
+		if len(refreshSignals) > 0 {
+			signal.Ignore(refreshSignals...)
+		}
+
+		env.status.Stopping()
+
+		// Best-effort graceful shutdown of status listener
+		if env.statusHTTP != nil {
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				//nolint:errcheck
+				env.statusHTTP.Shutdown(ctx)
+			}()
+		}
+
+		// Force-exit after timeout
+		time.AfterFunc(env.shutdownTimeout, func() {
+			// Graceful shutdown timeout reached. If we can't drain connections
+			// to exit gracefully after this timeout, let's just exit.
+			logger.Printf("graceful shutdown timeout: forcing exit")
+			exitFunc(1)
+		})
+
+		p.Shutdown()
+		logger.Printf("shutdown proxy, waiting for drain")
+	}
 
 	for {
 		// Wait for a signal
 		select {
+		case <-env.shutdownChannel:
+			logger.Printf("shutdown request processing")
+
+			shutdownFunc()
+
+			return
+		case <-serviceShutdownChan(): // nil on non-Windows; nil channel blocks forever, disabling this case
+			logger.Printf("Windows service stop requested, shutting down")
+
+			shutdownFunc()
+
+			return
 		case sig := <-signals:
 			if isShutdownSignal(sig) {
 				logger.Printf("received %s, shutting down", sig.String())
 
-				// Best-effort graceful shutdown of status listener
-				if context.statusHTTP != nil {
-					go context.statusHTTP.Shutdown(ctx.Background())
-				}
+				shutdownFunc()
 
-				// Force-exit after timeout
-				time.AfterFunc(context.shutdownTimeout, func() {
-					// Graceful shutdown timeout reached. If we can't drain connections
-					// to exit gracefully after this timeout, let's just exit.
-					logger.Printf("graceful shutdown timeout: forcing exit")
-					exitFunc(1)
-				})
-
-				p.Shutdown()
-				logger.Printf("shutdown proxy, waiting for drain")
 				return
 			}
 
 			logger.Printf("received %s, reloading TLS configuration", sig.String())
-			context.reload()
+			env.reload()
 		}
 	}
 }
 
-func (context *Context) reloadHandler(interval time.Duration) {
+func (env *Environment) reloadHandler(interval time.Duration) {
 	if interval == 0 {
 		return
 	}
 	for range time.Tick(interval) {
-		context.reload()
+		env.reload()
 	}
 }
 
-func (context *Context) reload() {
-	context.status.Reloading()
-	if err := context.tlsConfigSource.Reload(); err != nil {
-		logger.Printf("error reloading TLS configuration: %s", err)
+// reload re-reads the certificate and trust store, the proxy client
+// certificate and trust store (if an HTTPS proxy is configured), and the OPA
+// policy, then starts a new session generation so that no client can resume
+// into the configuration we just replaced.
+//
+// The ordering matters in both directions:
+//
+//   - The generation is advanced after all reloads, so a connection accepted
+//     on the new generation is guaranteed to have been evaluated against the
+//     reloaded policy. A connection accepted while a reload is in flight may
+//     still be evaluated against the old policy, but its ticket then belongs to
+//     the old generation and stops resuming as soon as this returns.
+//   - It is advanced before the status goes back to listening, so tests and
+//     operators can treat a listening status as "the new generation is in
+//     effect".
+//
+// It is advanced whether or not any reload succeeded. A reload that fails
+// leaves the old certificate and trust store in place, which is the point of
+// failing softly, but it must not also leave clients resuming sessions whose
+// access decision predates a policy that did reload.
+func (env *Environment) reload() {
+	env.status.Reloading()
+	if err := env.tlsConfigSource.Reload(); err != nil {
+		logger.Printf("error reloading TLS configuration: %v", err)
 	}
-	logger.Printf("reloading complete")
-	context.status.Listening()
+	if env.proxyTLSConfigSource != nil {
+		if err := env.proxyTLSConfigSource.Reload(); err != nil {
+			logger.Printf("error reloading proxy TLS configuration: %v", err)
+		}
+	}
+	if env.regoPolicy != nil {
+		if err := env.regoPolicy.Reload(); err != nil {
+			logger.Printf("error reloading OPA policy: %v", err)
+		}
+	}
+	env.sessionGeneration.Advance()
+	logger.Printf("reloading configuration complete")
+	env.status.Listening()
 }

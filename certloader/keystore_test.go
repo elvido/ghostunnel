@@ -18,11 +18,9 @@ package certloader
 
 import (
 	"crypto/tls"
-	"io/ioutil"
 	"os"
 	"runtime"
 	"testing"
-	"unsafe"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -75,25 +73,28 @@ plW93GyQzhwY+Cc1Of2ktdBwOHNn1xWyl3lgjAaW+da1nEhq6Anc
 -----END RSA PRIVATE KEY-----`
 
 func TestCertificateFromPEMFilesValid(t *testing.T) {
-	file, err := ioutil.TempFile("", "ghostunnel-test")
-	assert.Nil(t, err, "temp file error")
+	file, err := os.CreateTemp("", "ghostunnel-test")
+	assert.NoError(t, err, "temp file error")
 	defer os.Remove(file.Name())
 
 	_, err = file.Write([]byte(testCombinedCertificateAndKey))
-	assert.Nil(t, err, "temp file error")
+	assert.NoError(t, err, "temp file error")
 
 	cert, err := CertificateFromPEMFiles(file.Name(), file.Name(), file.Name())
-	assert.Nil(t, err, "should read PEM file with certificate & private key")
+	assert.NoError(t, err, "should read PEM file with certificate & private key")
+
+	id := cert.GetIdentifier()
+	assert.Equal(t, "CN=server", id, "cert should not have empty id")
 
 	c0, err := cert.GetCertificate(nil)
-	assert.Nil(t, err, "should have a valid tls.Certificate on GetCertificate call")
+	assert.NoError(t, err, "should have a valid tls.Certificate on GetCertificate call")
 
 	c1, err := cert.GetClientCertificate(nil)
-	assert.Nil(t, err, "should have a valid tls.Certificate on GetCertificate call")
+	assert.NoError(t, err, "should have a valid tls.Certificate on GetCertificate call")
 
-	assert.Equal(t, c0.Leaf.Subject.CommonName, "server", "should have the right cert")
-	assert.Equal(t, c1.Leaf.Subject.CommonName, "server", "should have the right cert")
-	assert.Nil(t, cert.Reload(), "should be able to reload")
+	assert.Equal(t, "server", c0.Leaf.Subject.CommonName, "should have the right cert")
+	assert.Equal(t, "server", c1.Leaf.Subject.CommonName, "should have the right cert")
+	assert.NoError(t, cert.Reload(), "should be able to reload")
 
 	// Remove file & test reload failure
 	if runtime.GOOS == "windows" {
@@ -102,52 +103,91 @@ func TestCertificateFromPEMFilesValid(t *testing.T) {
 	}
 
 	os.Remove(file.Name())
-	assert.NotNil(t, cert.Reload(), "should not be able to reload")
+	assert.Error(t, cert.Reload(), "should not be able to reload")
 }
 
 func TestCertificateFromPEMFilesInvalid(t *testing.T) {
-	file, err := ioutil.TempFile("", "ghostunnel-test")
-	assert.Nil(t, err, "temp file error")
+	file, err := os.CreateTemp("", "ghostunnel-test")
+	assert.NoError(t, err, "temp file error")
 	defer os.Remove(file.Name())
 
 	_, err = file.Write([]byte("invalid"))
-	assert.Nil(t, err, "temp file error")
+	assert.NoError(t, err, "temp file error")
 
 	cert, err := CertificateFromPEMFiles(file.Name(), file.Name(), file.Name())
 	assert.Nil(t, cert, "should not return certificate on error")
-	assert.NotNil(t, err, "should not read PEM file with invalid certificate & private key")
+	assert.Error(t, err, "should not read PEM file with invalid certificate & private key")
 }
 
 func TestCertificateFromPEMFilesTrustStore(t *testing.T) {
-	fileValid, err := ioutil.TempFile("", "ghostunnel-test")
-	assert.Nil(t, err, "temp file error")
+	fileValid, err := os.CreateTemp("", "ghostunnel-test")
+	assert.NoError(t, err, "temp file error")
 	defer os.Remove(fileValid.Name())
 
-	fileInvalid, err := ioutil.TempFile("", "ghostunnel-test")
-	assert.Nil(t, err, "temp file error")
+	fileInvalid, err := os.CreateTemp("", "ghostunnel-test")
+	assert.NoError(t, err, "temp file error")
 	defer os.Remove(fileInvalid.Name())
 
 	_, err = fileValid.Write([]byte(testCombinedCertificateAndKey))
-	assert.Nil(t, err, "temp file error")
+	assert.NoError(t, err, "temp file error")
 	_, err = fileInvalid.Write([]byte("invalid"))
-	assert.Nil(t, err, "temp file error")
+	assert.NoError(t, err, "temp file error")
 
 	cert, err := CertificateFromPEMFiles(fileValid.Name(), fileValid.Name(), fileInvalid.Name())
 	assert.Nil(t, cert, "should not return certificate on error")
-	assert.NotNil(t, err, "should read PEM file with invalid trust bundle")
+	assert.Error(t, err, "should read PEM file with invalid trust bundle")
+}
+
+// TestKeystoreReloadErrorKeepsOldCertificate verifies that when Reload() fails
+// (e.g. the file is overwritten with garbage on disk), the previously-loaded
+// certificate is still served instead of being cleared. This protects callers
+// from accidental loss of identity when reloads fail at runtime.
+func TestKeystoreReloadErrorKeepsOldCertificate(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// Reloading is not supported on Windows.
+		t.Skip("reload not supported on windows")
+	}
+
+	file, err := os.CreateTemp("", "ghostunnel-test")
+	assert.NoError(t, err, "temp file error")
+	defer os.Remove(file.Name())
+
+	_, err = file.Write([]byte(testCombinedCertificateAndKey))
+	assert.NoError(t, err, "temp file error")
+	assert.NoError(t, file.Close(), "close temp file")
+
+	cert, err := CertificateFromPEMFiles(file.Name(), file.Name(), file.Name())
+	assert.NoError(t, err, "should read valid PEM bundle")
+
+	before, err := cert.GetCertificate(nil)
+	assert.NoError(t, err, "should have valid cert before reload")
+	assert.NotNil(t, before, "cert should not be nil before reload")
+	assert.Equal(t, "server", before.Leaf.Subject.CommonName, "should have server CN before reload")
+
+	// Overwrite the file with garbage and try reloading.
+	assert.NoError(t, os.WriteFile(file.Name(), []byte("not a valid PEM file"), 0600), "rewrite file")
+
+	err = cert.Reload()
+	assert.Error(t, err, "Reload() should return error on garbage file")
+
+	// After failed reload, the old cert should still be served from cache.
+	after, err := cert.GetCertificate(nil)
+	assert.NoError(t, err, "should still serve cached cert after failed reload")
+	assert.NotNil(t, after, "cached cert should not be cleared by failed reload")
+	assert.Equal(t, "server", after.Leaf.Subject.CommonName, "should still serve original cert after failed reload")
+	assert.Equal(t, before.Leaf.Raw, after.Leaf.Raw, "cached leaf bytes should be unchanged")
 }
 
 func TestGetCachedCertificateKeystore(t *testing.T) {
 	tlscert := &tls.Certificate{}
-	kscert := &keystoreCertificate{
-		cachedCertificate: unsafe.Pointer(tlscert),
-	}
+	kscert := &keystoreCertificate{}
+	kscert.cachedCertificate.Store(tlscert)
 
 	c, err := kscert.GetCertificate(nil)
-	assert.Nil(t, err, "should be able to read certificate")
+	assert.NoError(t, err, "should be able to read certificate")
 	assert.Equal(t, tlscert, c)
 
 	c, err = kscert.GetClientCertificate(nil)
-	assert.Nil(t, err, "should be able to read certificate")
+	assert.NoError(t, err, "should be able to read certificate")
 	assert.Equal(t, tlscert, c)
 }

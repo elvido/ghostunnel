@@ -1,4 +1,4 @@
-// +build cgo
+//go:build cgo
 
 /*-
  * Copyright 2018 Square Inc.
@@ -20,28 +20,56 @@ package certloader
 
 import (
 	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"log"
+	"os"
 	"testing"
-	"unsafe"
 
 	"github.com/stretchr/testify/assert"
 )
 
 func TestInvalidPKCS11Module(t *testing.T) {
-	_, err := CertificateFromPKCS11Module("", "", "", "", "")
-	assert.NotNil(t, err, "should not load invalid PKCS11 certificate/key")
+	logger := log.New(os.Stdout, "", log.LstdFlags|log.Lmicroseconds)
+	_, err := CertificateFromPKCS11Module("", "", "", "", "", logger)
+	assert.Error(t, err, "should not load invalid PKCS11 certificate/key")
+}
+
+func TestPKCS11GetTrustStore(t *testing.T) {
+	pool := x509.NewCertPool()
+	pool.AddCert(&x509.Certificate{
+		Subject: pkix.Name{
+			CommonName: "test-ca",
+		},
+	})
+
+	p11cert := &pkcs11Certificate{}
+	p11cert.cachedCertPool.Store(pool)
+
+	result := p11cert.GetTrustStore()
+	assert.NotNil(t, result, "GetTrustStore should return the cached cert pool")
+	assert.Equal(t, pool, result, "GetTrustStore should return the same cert pool")
 }
 
 func TestGetCachedCertificatePKCS11(t *testing.T) {
-	tlscert := &tls.Certificate{}
-	p11cert := &pkcs11Certificate{
-		cachedCertificate: unsafe.Pointer(tlscert),
+	tlscert := &tls.Certificate{
+		Leaf: &x509.Certificate{
+			Subject: pkix.Name{
+				CommonName: "test",
+			},
+		},
 	}
+	p11cert := &pkcs11Certificate{}
+	p11cert.cachedCertificate.Store(tlscert)
+
+	id := p11cert.GetIdentifier()
+	assert.Equal(t, "CN=test", id, "cert should not have empty id")
 
 	c, err := p11cert.GetCertificate(nil)
-	assert.Nil(t, err, "should be able to read certificate")
+	assert.NoError(t, err, "should be able to read certificate")
 	assert.Equal(t, tlscert, c)
 
 	c, err = p11cert.GetClientCertificate(nil)
-	assert.Nil(t, err, "should be able to read certificate")
+	assert.NoError(t, err, "should be able to read certificate")
 	assert.Equal(t, tlscert, c)
 }

@@ -1,11 +1,35 @@
 package certloader
 
 import (
+	"context"
 	"crypto/tls"
-	"errors"
+	"crypto/x509"
+	"fmt"
+	"log"
+	"sync/atomic"
+	"time"
 
 	"github.com/caddyserver/certmagic"
-	"github.com/mholt/acmez"
+	"github.com/mholt/acmez/v3"
+)
+
+// loggerOrDefault returns l if non-nil, otherwise log.Default().
+func loggerOrDefault(l *log.Logger) *log.Logger {
+	if l != nil {
+		return l
+	}
+	return log.Default()
+}
+
+const defaultMaxAttempts = 5
+
+// acmeInitialBackoff and acmeMaxBackoff control the exponential backoff used
+// for the initial ACME certificate load. They are package-private vars so
+// tests can shorten the schedule without otherwise altering the production
+// code path.
+var (
+	acmeInitialBackoff = 5 * time.Second
+	acmeMaxBackoff     = 2 * time.Minute
 )
 
 // ACMEConfig stores the properties used for operating as an ACME client
@@ -19,7 +43,7 @@ type ACMEConfig struct {
 
 	// The email address to be associated with the ACME account used
 	// to obtain a certificate from the ACME CA. This email address
-	// may receive certificate lifecycle notificates from the ACME CA.
+	// may receive certificate lifecycle notifications from the ACME CA.
 	Email string
 
 	// The URL for the Production ACME CA to use. Defaults to the
@@ -33,12 +57,40 @@ type ACMEConfig struct {
 	// If true, use the Test/Staging ACME CA URL. If false, use the
 	// Production ACME CA URL. Defaults to false.
 	UseTestCA bool
+
+	// Path to a CA bundle file for verifying client certificates (mTLS).
+	// If empty, the system certificate pool is used.
+	CABundlePath string
+
+	// Maximum number of attempts to obtain the initial ACME certificate.
+	// Defaults to 5 if zero.
+	MaxAttempts int
+
+	// Override certmagic's background renewal-check interval. Zero means use
+	// certmagic's default (10 minutes). Intended for the integration test
+	// that needs to observe a renewal moment within a few seconds; not
+	// useful as a production tuning knob.
+	RenewCheckInterval time.Duration
+
+	// Override the port certmagic binds for TLS-ALPN-01 during initial
+	// issuance. Zero means use 443 (the RFC 8737 port). Intended for the
+	// integration test so it can run without privileged-port binding;
+	// production deployments should leave this unset.
+	AltTLSALPNPort int
+
+	// Logger is used for retry messages during initial certificate issuance.
+	// Callers should pass ghostunnel's logger so these messages honor
+	// --syslog and --quiet. If nil, log.Default() is used, which writes to
+	// stderr regardless of those flags.
+	Logger *log.Logger
 }
 
+// TLSConfigSourceFromACME creates a TLSConfigSource that obtains certificates via ACME.
 func TLSConfigSourceFromACME(acme *ACMEConfig) (TLSConfigSource, error) {
 	certmagic.DefaultACME.DisableHTTPChallenge = true
 	certmagic.DefaultACME.Agreed = acme.TOSAgreed
 	certmagic.DefaultACME.Email = acme.Email
+	certmagic.DefaultACME.AltTLSALPNPort = acme.AltTLSALPNPort
 
 	// certmagic uses its ACMEManager.CA value as the CA to use for obtaining
 	// certs. If the desired goal is for ghostunnel to use the ACME CAs test
@@ -69,30 +121,106 @@ func TLSConfigSourceFromACME(acme *ACMEConfig) (TLSConfigSource, error) {
 		}
 	}
 
-	magicConfig := certmagic.NewDefault()
+	magicConfig := newCertmagicConfig(acme.RenewCheckInterval)
 
-	// Force an iniial synchronous load of the certificate on startup. If no certificate
+	// Force an initial synchronous load of the certificate on startup,
+	// but retry with backoff instead of exiting the whole process. If no certificate
 	// yet exists, certmagic will attempt to obtain one from the ACME provider. If a valid
 	// cert has already been obtained, it will be loaded from local cache.
-	err := magicConfig.ManageSync([]string{acme.FQDN})
+	backoff := acmeInitialBackoff
+	maxBackoff := acmeMaxBackoff
+	maxAttempts := acme.MaxAttempts
+	if maxAttempts == 0 {
+		maxAttempts = defaultMaxAttempts
+	}
+
+	logger := loggerOrDefault(acme.Logger)
+	var err error
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		err = magicConfig.ManageSync(context.Background(), []string{acme.FQDN})
+		if err == nil {
+			break
+		}
+
+		if attempt < maxAttempts {
+			logger.Printf(
+				"warning: unable to load initial ACME certificate (attempt %d/%d): %v; retrying in %s",
+				attempt, maxAttempts, err, backoff,
+			)
+
+			time.Sleep(backoff)
+
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+		}
+	}
+
 	if err != nil {
 		return nil, err
 	}
 
-	return &acmeTLSConfigSource{
+	return newACMETLSConfigSource(magicConfig, acme)
+}
+
+// newCertmagicConfig builds a certmagic.Config. If renewCheckInterval > 0,
+// it creates a fresh Cache with that interval; otherwise it uses
+// certmagic.NewDefault() and the package singleton cache (production path).
+func newCertmagicConfig(renewCheckInterval time.Duration) *certmagic.Config {
+	if renewCheckInterval <= 0 {
+		return certmagic.NewDefault()
+	}
+	var cache *certmagic.Cache
+	cache = certmagic.NewCache(certmagic.CacheOptions{
+		GetConfigForCert: func(certmagic.Certificate) (*certmagic.Config, error) {
+			return certmagic.New(cache, certmagic.Default), nil
+		},
+		RenewCheckInterval: renewCheckInterval,
+		Logger:             certmagic.Default.Logger,
+	})
+	return certmagic.New(cache, certmagic.Default)
+}
+
+func newACMETLSConfigSource(magicConfig *certmagic.Config, acme *ACMEConfig) (*acmeTLSConfigSource, error) {
+	trustStore, err := LoadTrustStore(acme.CABundlePath)
+	if err != nil {
+		return nil, fmt.Errorf("loading trust store: %w", err)
+	}
+
+	source := &acmeTLSConfigSource{
 		magicConfig:  magicConfig,
 		gtACMEConfig: acme,
-	}, nil
+		caBundlePath: acme.CABundlePath,
+	}
+	source.cachedTrustStore.Store(trustStore)
+
+	return source, nil
 }
 
 type acmeTLSConfigSource struct {
 	magicConfig  *certmagic.Config
 	gtACMEConfig *ACMEConfig
+	caBundlePath string
+	// Cached *x509.CertPool
+	cachedTrustStore atomic.Pointer[x509.CertPool]
 }
 
 func (a *acmeTLSConfigSource) Reload() error {
-	// certmagic automatically keeps certs updated
+	// certmagic automatically keeps certs updated, but we need to
+	// reload the trust store (CA bundle) from disk.
+	bundle, err := LoadTrustStore(a.caBundlePath)
+	if err != nil {
+		return fmt.Errorf("loading trust store: %w", err)
+	}
+
+	a.cachedTrustStore.Store(bundle)
 	return nil
+}
+
+func (a *acmeTLSConfigSource) getTrustStore() *x509.CertPool {
+	return a.cachedTrustStore.Load()
 }
 
 func (a *acmeTLSConfigSource) CanServe() bool {
@@ -107,12 +235,12 @@ func (a *acmeTLSConfigSource) GetClientConfig(base *tls.Config) (TLSClientConfig
 	// exposed to the internet on tcp/443, then ACME is not suitable for obtaining client certs.
 	// It should not be possible for ghostunnel to attempt to use this TLSConfigSource when
 	// started in client mode.
-	return nil, errors.New("ACME is not supported in client mode")
+	return nil, ErrACMENotSupportedClient
 }
 
 func (a *acmeTLSConfigSource) GetServerConfig(base *tls.Config) (TLSServerConfig, error) {
 	if !a.CanServe() {
-		return nil, errors.New("ACME certificate currently unavailable")
+		return nil, ErrACMECertUnavailable
 	}
 	if base == nil {
 		base = new(tls.Config)
@@ -120,17 +248,111 @@ func (a *acmeTLSConfigSource) GetServerConfig(base *tls.Config) (TLSServerConfig
 	return &acmeTLSConfig{
 		magicConfig: a.magicConfig,
 		base:        base,
+		source:      a,
 	}, nil
 }
 
 type acmeTLSConfig struct {
 	magicConfig *certmagic.Config
 	base        *tls.Config
+	source      *acmeTLSConfigSource
+
+	// Cached config, keyed on the trust-store pointer.
+	cachedServer atomic.Pointer[cachedTLSConfig]
 }
 
 func (a *acmeTLSConfig) GetServerConfig() *tls.Config {
+	pool := a.source.getTrustStore()
+	if cached := a.cachedServer.Load(); cached != nil && cached.pool == pool {
+		return cached.config
+	}
+	config := a.buildServerConfig(pool)
+	a.cachedServer.Store(&cachedTLSConfig{pool: pool, config: config})
+	return config
+}
+
+// buildServerConfig constructs the shared server config for the given trust
+// store. The returned config is cached and shared across connections, so it
+// must never be mutated afterward. NextProtos is built on a fresh slice so
+// repeated builds never alias or grow the base config's NextProtos.
+func (a *acmeTLSConfig) buildServerConfig(pool *x509.CertPool) *tls.Config {
 	config := a.base.Clone()
 	config.GetCertificate = a.magicConfig.GetCertificate
-	config.NextProtos = append(config.NextProtos, acmez.ACMETLS1Protocol)
+	// Under RequireAnyClientCert (SPKI pin mode) no chain verification happens,
+	// so ClientCAs never authenticates anything; its only effect is the
+	// certificate_authorities hint Go advertises in the handshake. In pin mode
+	// that hint is actively misleading — a strict client may withhold a pinned
+	// cert that doesn't chain to it — so we leave ClientCAs nil.
+	if a.base.ClientAuth != tls.RequireAnyClientCert {
+		config.ClientCAs = pool
+	}
+	config.NextProtos = append(append([]string(nil), a.base.NextProtos...), acmez.ACMETLS1Protocol)
+
+	// The ACME CA's TLS-ALPN-01 validator opens a probe handshake with
+	// SupportedProtos=["acme-tls/1"] (per RFC 8737) and no client certificate.
+	// If the base config requires a client cert (ghostunnel's mTLS default),
+	// that probe fails and renewal silently breaks. Relax ClientAuth for that
+	// exact ALPN only — every real client still gets the base mTLS enforcement.
+	//
+	// Tightening to prevent mTLS bypass — mirror certmagic's own gate at
+	// vendor/github.com/caddyserver/certmagic/handshake.go: relax only when
+	// the ClientHello matches the shape RFC 8737 mandates for a validator.
+	//   - SNI is set. RFC 8737 §3 requires the validator to send the SNI of
+	//     the domain being validated, and certmagic refuses to serve the
+	//     challenge cert without it.
+	//   - SupportedProtos is *exactly* ["acme-tls/1"]. A client sending
+	//     ["acme-tls/1", "h2"] is not a validator and must not relax.
+	//   - Force NextProtos=["acme-tls/1"] in the relaxed config so ALPN
+	//     cannot negotiate to a different protocol on the relaxed handshake.
+	//   - Disable session tickets so a ticket issued during a probe cannot
+	//     be resumed by a real client to skip mTLS. (tls.Config has no
+	//     server-side session cache field; SessionTicketsDisabled is the
+	//     full server-side disable.)
+	config.GetConfigForClient = func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
+		if chi.ServerName == "" ||
+			len(chi.SupportedProtos) != 1 ||
+			chi.SupportedProtos[0] != acmez.ACMETLS1Protocol {
+			return nil, nil
+		}
+		c := config.Clone()
+		c.ClientAuth = tls.NoClientCert
+		c.ClientCAs = nil
+		c.NextProtos = []string{acmez.ACMETLS1Protocol}
+		c.SessionTicketsDisabled = true
+		return c, nil
+	}
+
+	return config
+}
+
+// WithoutACMEChallenge wraps a TLSServerConfig obtained from an ACME source
+// and strips the TLS-ALPN-01 challenge plumbing from the configs it returns:
+// the acme-tls/1 entry in NextProtos and the GetConfigForClient hook that
+// serves challenge certificates to validator-shaped handshakes. The ACME CA
+// only ever delivers the challenge to the tunnel listener (port 443 of the
+// validated FQDN), so a listener that doesn't serve challenges (e.g. the
+// status port) shouldn't advertise acme-tls/1 — with no other protocols
+// configured it would otherwise advertise only acme-tls/1 and reject any
+// client that offers ALPN.
+func WithoutACMEChallenge(inner TLSServerConfig) TLSServerConfig {
+	return &acmeStrippedTLSConfig{inner: inner}
+}
+
+type acmeStrippedTLSConfig struct {
+	inner TLSServerConfig
+}
+
+func (c *acmeStrippedTLSConfig) GetServerConfig() *tls.Config {
+	// The inner config is cached and shared across connections, so work on a
+	// clone rather than mutating it.
+	config := c.inner.GetServerConfig().Clone()
+	var protos []string
+	for _, proto := range config.NextProtos {
+		if proto != acmez.ACMETLS1Protocol {
+			protos = append(protos, proto)
+		}
+	}
+	config.NextProtos = protos
+	config.GetConfigForClient = nil
 	return config
 }

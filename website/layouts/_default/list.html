@@ -1,0 +1,132 @@
+{{ define "main" }}
+{{ if eq .Section "docs" }}
+<div class="with-sidebar">
+  {{ partial "sidebar.html" . }}
+  <article class="content" data-pagefind-body>
+    <h1>{{ .Title }}</h1>
+    {{ .Content }}
+    {{ if .Sections }}
+    {{ range .Sections.ByWeight }}
+    <section class="docs-section">
+      <h2><a href="{{ .RelPermalink }}">{{ .Title }}</a></h2>
+      {{ with .Description }}<p>{{ . }}</p>{{ end }}
+      <div class="docs-list">
+        {{ range .RegularPages.ByWeight }}
+        <a class="docs-card" href="{{ .RelPermalink }}">
+          <h3>{{ .Title }}</h3>
+          {{ with .Description }}<p>{{ . }}</p>{{ end }}
+        </a>
+        {{ end }}
+      </div>
+    </section>
+    {{ end }}
+    {{ else }}
+    <div class="docs-list">
+      {{ range .RegularPages.ByWeight }}
+      <a class="docs-card" href="{{ .RelPermalink }}">
+        <h3>{{ .Title }}</h3>
+        {{ with .Description }}<p>{{ . }}</p>{{ end }}
+      </a>
+      {{ end }}
+    </div>
+    {{ end }}
+  </article>
+</div>
+{{ else if eq .Section "releases" }}
+<article class="content">
+  <h1>{{ .Title }}</h1>
+  <p>All releases of Ghostunnel, in reverse chronological order. Pre-built binaries are available on <a href="https://github.com/ghostunnel/ghostunnel/releases">GitHub Releases</a> (linked below) and Docker images can be found on <a href="https://hub.docker.com/r/ghostunnel/ghostunnel">Docker Hub</a>.</p>
+  {{ $allPages := .Pages.ByDate.Reverse }}
+  {{ $stable := where $allPages ".Params.prerelease" "ne" true }}
+  {{ $prereleases := where $allPages ".Params.prerelease" true }}
+  {{/* Determine featured releases: latest RC (if newer than latest stable) + latest stable */}}
+  {{ $latestStable := index $stable 0 }}
+  {{ $latestRC := false }}
+  {{ with $prereleases }}
+    {{ $candidate := index . 0 }}
+    {{ if $candidate.Date.After $latestStable.Date }}
+      {{ $latestRC = $candidate }}
+    {{ end }}
+  {{ end }}
+  {{/* Build a set of featured page paths for deduplication */}}
+  {{ $featured := slice $latestStable.File.Path }}
+  {{ with $latestRC }}
+    {{ $featured = $featured | append .File.Path }}
+  {{ end }}
+  {{/* Render latest RC (if present) */}}
+  {{ with $latestRC }}
+  {{ $p := . }}
+  <div class="release-entry" id="{{ $p.Title }}">
+    <div class="release-header">
+      <h2>{{ $p.Title }}</h2>
+      <div class="release-meta">
+        <time datetime="{{ $p.Date.Format "2006-01-02" }}">{{ $p.Date.Format "January 2, 2006" }}</time>
+        <span class="badge pre-release">Pre-release</span>
+        <span class="release-links">
+          <a href="https://github.com/ghostunnel/ghostunnel/releases/tag/{{ $p.Title }}">{{ partial "icon-github.html" }} GitHub</a>
+        </span>
+      </div>
+    </div>
+    <div class="release-body">
+      {{ partial "linkify-prs.html" $p.Content }}
+    </div>
+    {{ partial "release-downloads.html" $p }}
+  </div>
+  {{ end }}
+  {{/* Render latest stable */}}
+  {{ $p := $latestStable }}
+  <div class="release-entry" id="{{ $p.Title }}">
+    <div class="release-header">
+      <h2>{{ $p.Title }}</h2>
+      <div class="release-meta">
+        <time datetime="{{ $p.Date.Format "2006-01-02" }}">{{ $p.Date.Format "January 2, 2006" }}</time>
+        {{ with $latestRC }}<span class="badge stable">Stable</span>{{ end }}
+        <span class="release-links">
+          <a href="https://github.com/ghostunnel/ghostunnel/releases/tag/{{ $p.Title }}">{{ partial "icon-github.html" }} GitHub</a>
+          <a href="https://hub.docker.com/r/ghostunnel/ghostunnel/tags?name={{ $p.Title }}">{{ partial "icon-docker.html" }} Docker Hub</a>
+        </span>
+      </div>
+    </div>
+    <div class="release-body">
+      {{ partial "linkify-prs.html" $p.Content }}
+    </div>
+    {{ partial "release-downloads.html" $p }}
+  </div>
+  {{/* Render older releases (everything not featured) */}}
+  {{ $older := where $allPages ".File.Path" "not in" $featured }}
+  {{ with $older }}
+  <div id="older-releases" class="older-releases" hidden>
+    {{ range $i, $p := . }}
+    <div class="release-entry" id="{{ $p.Title }}">
+      <div class="release-header">
+        <h2>{{ $p.Title }}</h2>
+        <div class="release-meta">
+          <time datetime="{{ $p.Date.Format "2006-01-02" }}">{{ $p.Date.Format "January 2, 2006" }}</time>
+          {{ if $p.Params.prerelease }}<span class="badge pre-release">Pre-release</span>{{ end }}
+          <span class="release-links">
+            <a href="https://github.com/ghostunnel/ghostunnel/releases/tag/{{ $p.Title }}">{{ partial "icon-github.html" }} GitHub</a>
+            {{ if not $p.Params.prerelease }}<a href="https://hub.docker.com/r/ghostunnel/ghostunnel/tags?name={{ $p.Title }}">{{ partial "icon-docker.html" }} Docker Hub</a>{{ end }}
+          </span>
+        </div>
+      </div>
+      <div class="release-body">
+        {{ partial "linkify-prs.html" $p.Content }}
+      </div>
+    </div>
+    {{ end }}
+  </div>
+  <button class="show-all-releases" onclick="var el=document.getElementById('older-releases');el.hidden=!el.hidden;this.textContent=el.hidden?'Show all releases ({{ len . }} more)':'Show fewer releases';">Show all releases ({{ len . }} more)</button>
+  {{ end }}
+</article>
+{{ else }}
+<article class="content">
+  <h1>{{ .Title }}</h1>
+  {{ .Content }}
+  {{ range .Pages }}
+  <div>
+    <h3><a href="{{ .RelPermalink }}">{{ .Title }}</a></h3>
+  </div>
+  {{ end }}
+</article>
+{{ end }}
+{{ end }}

@@ -1,0 +1,19 @@
+<nav class="site-nav">
+  <div class="nav-inner">
+    <a href="{{ .Site.Home.RelPermalink }}" class="nav-title">
+      {{ partial "ghost-logo.html" }}
+      {{ .Site.Title }}
+    </a>
+    <input type="checkbox" id="nav-toggle" class="nav-toggle" aria-label="Toggle navigation">
+    <label for="nav-toggle" class="nav-toggle-label" aria-hidden="true">
+      <span></span>
+    </label>
+    <ul class="nav-links">
+      {{ range .Site.Menus.main }}
+      {{- $external := hasPrefix .URL "http" -}}
+      {{- $active := and (not $external) (hasPrefix $.RelPermalink .URL) -}}
+      <li><a href="{{ .URL }}"{{ if $external }} target="_blank" rel="noopener"{{ end }}{{ if $active }} class="active" aria-current="page"{{ end }}>{{ with .Params.icon }}{{ partial (printf "%s.html" .) }}{{ end }}<span>{{ .Name }}</span></a></li>
+      {{ end }}
+    </ul>
+  </div>
+</nav>

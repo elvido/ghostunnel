@@ -1,80 +1,124 @@
 ---
 name: Test 
+permissions:
+  contents: read
 
 on:
   push:
-    branches: [ master ]
+    branches: [ master, next ]
   pull_request:
     branches: [ master ]
+  workflow_dispatch:
 
 jobs:
-  build:
-    name: Unit tests
-    strategy:
-      matrix:
-        version: [1.16.x]
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+  test-race:
+    # The race detector is incompatible with the -covermode=count
+    # instrumentation the main test jobs use, so it gets its own job. Several
+    # tests (cached TLS configs, timer CAS loops, runtime-collector
+    # registration) only have teeth under -race.
+    name: Tests (race detector)
+    runs-on: ubuntu-24.04
     steps:
+      - name: Checkout
+        uses: actions/checkout@v7
       - name: Set up Go
-        uses: actions/setup-go@v2
+        uses: actions/setup-go@v6
         with:
-          go-version: ${{ matrix.version }}
-        id: go
-      - name: Check out code
-        uses: actions/checkout@v2
-      - name: Build binary
-        run: make ghostunnel
-      - name: Run tests
-        run: make unit
-      
-  integration-linux:
-    name: Integration tests (Linux)
+          go-version: stable
+          cache: false
+      - name: Run tests with race detector
+        run: go tool mage -v test:race
+
+  test:
+    name: Tests
     strategy:
       matrix:
-        version: [1.16]
-        os: [ubuntu-latest]
+        os: [ubuntu-22.04, ubuntu-24.04, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - name: Check out code
-        uses: actions/checkout@v2
-      - name: Run tests 
-        run: GO_VERSION=${{ matrix.version }} make docker-test
-      - name: Codecov upload
-        uses: codecov/codecov-action@v1
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Set up Go
+        uses: actions/setup-go@v7
         with:
-          files: ./coverage-merged.out
+          go-version: stable
+          cache: false
+        id: go
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.11.x'
+      - name: Install test dependencies (Linux)
+        if: contains(matrix.os, 'ubuntu')
+        run: sudo apt-get update && sudo apt-get install -y default-jre-headless
+      - name: Run tests
+        run: go tool mage -v test:all
+      - name: Codecov upload
+        if: ${{ github.actor != 'dependabot[bot]' }}
+        uses: codecov/codecov-action@v7
+        with:
+          files: ./coverage/all.profile
+          flags: ${{ contains(matrix.os, 'ubuntu') && 'linux' || (contains(matrix.os, 'macos') && 'darwin' || 'windows') }}
+          fail_ci_if_error: true
+          verbose: true
+          token: ${{ secrets.CODECOV_TOKEN }}
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+      
+  test-freebsd:
+    name: Tests (FreeBSD)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Run tests in FreeBSD VM
+        uses: vmactions/freebsd-vm@a2f9a41fa97f6848b8c3b791087dfcdaa5b473ff # v1.5.8
+        with:
+          release: '14.3'
+          usesh: true
+          prepare: |
+            pkg install -y go python3
+          run: |
+            go version
+            python3 --version
+            go tool mage -v test:all
+      - name: Codecov upload
+        if: ${{ github.actor != 'dependabot[bot]' }}
+        uses: codecov/codecov-action@v7
+        with:
+          files: ./coverage/all.profile
+          flags: freebsd
+          fail_ci_if_error: true
+          verbose: true
+          token: ${{ secrets.CODECOV_TOKEN }}
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  test-docker:
+    name: Tests (PKCS#11/SoftHSM)
+    strategy:
+      matrix:
+        os: [ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache: false
+      - name: Run tests in Docker
+        run: go tool mage -v test:docker
+      - name: Codecov upload
+        uses: codecov/codecov-action@v7
+        if: ${{ github.actor != 'dependabot[bot]' }}
+        with:
+          files: ./coverage/all.profile
           flags: linux
           fail_ci_if_error: true
           verbose: true
-    
-  integration-darwin:
-    name: Integration tests (Darwin)
-    strategy:
-      matrix:
-        version: [1.16.x]
-        os: [macos-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - name: Set up Go
-        uses: actions/setup-go@v2
-        with:
-          go-version: ${{ matrix.version }}
-        id: go
-      - name: Set up Python
-        uses: actions/setup-python@v2
-        with:
-          python-version: '3.x'
-      - name: Install gocovmerge
-        run: go get -v github.com/wadey/gocovmerge
-      - name: Check out code
-        uses: actions/checkout@v2
-      - name: Run tests
-        run: make test 
-      - name: Codecov upload
-        uses: codecov/codecov-action@v1
-        with:
-          files: ./coverage-merged.out
-          flags: darwin
-          fail_ci_if_error: true
-          verbose: true
+          token: ${{ secrets.CODECOV_TOKEN }}
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}

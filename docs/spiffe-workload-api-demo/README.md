@@ -1,8 +1,8 @@
 # SPIFFE Workload API Support Demo
 
-The following demonstrates using the SPIFFE Workload API to supply Ghostunnel
-with an X.509 identity and trusted CA roots that are used to facilite
-communication between a frontend and backend service.
+This demo shows Ghostunnel using the SPIFFE Workload API to obtain X.509
+identities and trusted CA roots for mutual TLS between a frontend and backend
+service.
 
 ## Prerequisites
 
@@ -15,7 +15,7 @@ communication between a frontend and backend service.
 There are several processes involved in the demo:
 
 * Frontend client that sends TCP data
-* Frontend Ghostunnel that receives TCP data forwards it to the backend
+* Frontend Ghostunnel that receives TCP data and forwards it to the backend
   Ghostunnel over SPIFFE-authenticated mutual TLS
 * Backend Ghostunnel that receives TCP data over SPIFFE-authenticated mutual
   TLS and forwards it to the backend server
@@ -89,7 +89,7 @@ $ ./07-run-backend.sh
 
 ### Send the Frontend Request
 
-Run the following the send a request from the frontend.
+Run the following to send a request from the frontend.
 
 ```
 $ ./08-send-frontend-request.sh

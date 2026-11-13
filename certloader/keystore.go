@@ -1,5 +1,6 @@
 /*-
  * Copyright 2018 Square Inc.
+ * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,23 +21,19 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
-	"sync/atomic"
-	"unsafe"
+	"fmt"
 )
 
 type keystoreCertificate struct {
+	baseCertificate
 	// Keystore or PEM files path
 	keystorePaths []string
 	// Password for keystore (may be empty)
 	keystorePassword string
 	// Root CA bundle path
 	caBundlePath string
-	// File format as an indicator for certigo/lib
+	// File format indicator (e.g. "PEM", "PKCS12", "JCEKS", "DER", or "" for auto-detect)
 	format string
-	// Cached *tls.Certificate
-	cachedCertificate unsafe.Pointer
-	// Cached *x509.CertPool
-	cachedCertPool unsafe.Pointer
 }
 
 // CertificateFromPEMFiles creates a reloadable certificate from a set of PEM files.
@@ -72,9 +69,9 @@ func CertificateFromKeystore(keystorePath, keystorePassword, caBundlePath string
 func (c *keystoreCertificate) Reload() error {
 	var pemBlocks []*pem.Block
 	for _, path := range c.keystorePaths {
-		blocks, err := readPEM(path, c.keystorePassword, c.format)
+		blocks, err := readCertificateFile(path, c.keystorePassword, c.format)
 		if err != nil {
-			return err
+			return fmt.Errorf("reading certificate file: %w", err)
 		}
 		pemBlocks = append(pemBlocks, blocks...)
 	}
@@ -86,36 +83,21 @@ func (c *keystoreCertificate) Reload() error {
 
 	certAndKey, err := tls.X509KeyPair(pemBytes, pemBytes)
 	if err != nil {
-		return err
+		return fmt.Errorf("parsing X509 key pair: %w", err)
 	}
 
 	certAndKey.Leaf, err = x509.ParseCertificate(certAndKey.Certificate[0])
 	if err != nil {
-		return err
+		return fmt.Errorf("parsing leaf certificate: %w", err)
 	}
 
 	bundle, err := LoadTrustStore(c.caBundlePath)
 	if err != nil {
-		return err
+		return fmt.Errorf("loading trust store: %w", err)
 	}
 
-	atomic.StorePointer(&c.cachedCertificate, unsafe.Pointer(&certAndKey))
-	atomic.StorePointer(&c.cachedCertPool, unsafe.Pointer(bundle))
+	c.cachedCertificate.Store(&certAndKey)
+	c.cachedCertPool.Store(bundle)
 
 	return nil
-}
-
-// GetCertificate retrieves the actual underlying tls.Certificate.
-func (c *keystoreCertificate) GetCertificate(clientHello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-	return (*tls.Certificate)(atomic.LoadPointer(&c.cachedCertificate)), nil
-}
-
-// GetClientCertificate retrieves the actual underlying tls.Certificate.
-func (c *keystoreCertificate) GetClientCertificate(certInfo *tls.CertificateRequestInfo) (*tls.Certificate, error) {
-	return (*tls.Certificate)(atomic.LoadPointer(&c.cachedCertificate)), nil
-}
-
-// GetTrustStore returns the most up-to-date version of the trust store / CA bundle.
-func (c *keystoreCertificate) GetTrustStore() *x509.CertPool {
-	return (*x509.CertPool)(atomic.LoadPointer(&c.cachedCertPool))
 }

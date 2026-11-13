@@ -4,6 +4,7 @@ import (
 	"crypto"
 	"crypto/x509"
 	"errors"
+	"log"
 )
 
 var (
@@ -13,13 +14,13 @@ var (
 )
 
 const (
-	// Require a hardware token when fetching identities (Darwin only).
+	// RequireToken requires a hardware token when fetching identities (Darwin only).
 	RequireToken = 1
 )
 
 // Open opens the system's certificate store.
-func Open() (Store, error) {
-	return openStore()
+func Open(logger *log.Logger) (Store, error) {
+	return openStore(logger)
 }
 
 // Store represents the system's certificate store.

@@ -1,0 +1,51 @@
+#!/usr/bin/env python3
+
+"""
+Tests code paths with invalid policy.
+"""
+
+from common import LOCALHOST, RootCert, STATUS_PORT, \
+    print_ok, run_ghostunnel, terminate, LISTEN_PORT, TARGET_PORT
+
+from tempfile import mkdtemp
+import shutil
+import os
+
+ghostunnel = None
+try:
+    # create certs
+    root = RootCert('root')
+    root.create_signed_cert(
+        'server',
+        san='DNS:server,IP:127.0.0.1,IP:::1,DNS:localhost')
+    root.create_signed_cert(
+        'client1',
+        san='DNS:client1,IP:127.0.0.1,IP:::1,DNS:localhost')
+    root.create_signed_cert(
+        'client2',
+        san='DNS:client2,IP:127.0.0.1,IP:::1,DNS:localhost')
+
+    # start ghostunnel
+    dir_path = os.path.dirname(os.path.realpath(__file__))
+    tmp_dir = mkdtemp()
+    shutil.copyfile(dir_path + '/test-server-allow-opa-policy.tar.gz', tmp_dir + '/bundle.tar.gz')
+
+    ghostunnel = run_ghostunnel(['server',
+                                 '--listen={0}:{1}'.format(LOCALHOST, LISTEN_PORT),
+                                 '--target={0}:{1}'.format(LOCALHOST, TARGET_PORT),
+                                 '--keystore=server.p12',
+                                 '--cacert=root.crt',
+                                 '--allow-policy=' + tmp_dir + '/bundle.tar.gz',
+                                 '--allow-query=xxx@invalid',
+                                 '--status={0}:{1}'.format(LOCALHOST,
+                                                           STATUS_PORT)])
+
+    # wait for ghostunnel to exit and make sure error code is not zero
+    ret = ghostunnel.wait(timeout=10)
+    if ret == 0:
+        raise Exception(
+            'ghostunnel terminated with zero, though flags were invalid')
+    else:
+        print_ok("OK (terminated)")
+finally:
+    terminate(ghostunnel)

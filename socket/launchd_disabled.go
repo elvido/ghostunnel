@@ -1,4 +1,4 @@
-// +build !darwin
+//go:build !darwin || !cgo
 
 /*-
  * Copyright 2019 Square Inc.

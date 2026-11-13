@@ -1,4 +1,4 @@
-// +build linux
+//go:build linux
 
 /*-
  * Copyright 2019 Square Inc.
@@ -21,22 +21,40 @@ package socket
 import (
 	"fmt"
 	"net"
+	"sync"
 
-	"github.com/coreos/go-systemd/activation"
+	"github.com/coreos/go-systemd/v22/activation"
+)
+
+// activation.ListenersWithNames consumes the LISTEN_FDS environment on first
+// call (so the fds aren't inherited by child processes), which means we can
+// only ask the activation library for sockets once. Cache the result so
+// callers requesting different names (e.g. --listen=systemd:foo and
+// --status=systemd:bar) all see the full set.
+var (
+	systemdListenersOnce sync.Once
+	systemdListeners     map[string][]net.Listener
+	errSystemdListeners  error
 )
 
 func systemdSocket(name string) (net.Listener, error) {
-	listeners, err := activation.ListenersWithNames()
-	if err != nil {
-		return nil, err
+	systemdListenersOnce.Do(func() {
+		systemdListeners, errSystemdListeners = activation.ListenersWithNames()
+	})
+	if errSystemdListeners != nil {
+		return nil, errSystemdListeners
 	}
 
+	return systemdSocketFromMap(name, systemdListeners)
+}
+
+func systemdSocketFromMap(name string, listeners map[string][]net.Listener) (net.Listener, error) {
 	if listener, ok := listeners[name]; ok {
-		if len(listeners) != 1 {
-			return nil, fmt.Errorf("expected exactly 1 listening socket configured in systemd for name %s, found %d", name, len(listeners))
+		if len(listener) != 1 {
+			return nil, fmt.Errorf("expected exactly 1 listening socket configured in systemd for name %q, found %d", name, len(listener))
 		}
-		return listener[0], err
+		return listener[0], nil
 	}
 
-	return nil, fmt.Errorf("expected listener with name %s, but found none", name)
+	return nil, fmt.Errorf("expected listener with name %q, but found none", name)
 }

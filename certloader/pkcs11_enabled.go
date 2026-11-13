@@ -1,4 +1,4 @@
-// +build cgo,!nopkcs11
+//go:build cgo && !nopkcs11
 
 /*-
  * Copyright 2018 Square Inc.
@@ -19,25 +19,28 @@
 package certloader
 
 import (
+	"crypto"
 	"crypto/tls"
-	"crypto/x509"
-	"sync/atomic"
-	"unsafe"
+	"fmt"
+	"log"
 
 	pkcs11key "github.com/letsencrypt/pkcs11key/v4"
 )
 
+type pkcs11PublicKey interface {
+	Equal(x crypto.PublicKey) bool
+}
+
 type pkcs11Certificate struct {
+	baseCertificate
 	// Certificate chain corresponding to key
 	certificatePath string
 	// Root CA bundle path
 	caBundlePath string
 	// Params for loading key from a PKCS#11 module
 	modulePath, tokenLabel, pin string
-	// Cached *tls.Certificate
-	cachedCertificate unsafe.Pointer
-	// Cached *x509.CertPool
-	cachedCertPool unsafe.Pointer
+	// Added logger, useful for PKCS#11 logging
+	logger *log.Logger
 }
 
 // SupportsPKCS11 returns true or false, depending on whether the binary
@@ -47,13 +50,14 @@ func SupportsPKCS11() bool {
 }
 
 // CertificateFromPKCS11Module creates a reloadable certificate from a PKCS#11 module.
-func CertificateFromPKCS11Module(certificatePath, caBundlePath, modulePath, tokenLabel, pin string) (Certificate, error) {
+func CertificateFromPKCS11Module(certificatePath, caBundlePath, modulePath, tokenLabel, pin string, logger *log.Logger) (Certificate, error) {
 	c := &pkcs11Certificate{
 		certificatePath: certificatePath,
 		caBundlePath:    caBundlePath,
 		modulePath:      modulePath,
 		tokenLabel:      tokenLabel,
 		pin:             pin,
+		logger:          logger,
 	}
 	err := c.Reload()
 	if err != nil {
@@ -68,7 +72,7 @@ func (c *pkcs11Certificate) Reload() error {
 	// with the (fixed) private key being in an HSM/PKCS11 module.
 	certs, err := readX509(c.certificatePath)
 	if err != nil {
-		return err
+		return fmt.Errorf("loading certificate: %w", err)
 	}
 
 	certAndKey := tls.Certificate{
@@ -81,39 +85,37 @@ func (c *pkcs11Certificate) Reload() error {
 	// Reuse previously loaded PKCS11 private key if we already have it.
 	// We want to avoid reloading the key every time the cert reloads, as it's
 	// a potentially expensive operation that calls out into a shared library.
-	if c.cachedCertificate != nil {
-		old, _ := c.GetCertificate(nil)
+	if old := c.cachedCertificate.Load(); old != nil {
+		// The HSM private key handle is bound to a specific public key. If the
+		// certificate file was swapped for one with a different key, reusing the
+		// cached handle would publish a mismatched cert+key pair that breaks
+		// every new handshake. Verify the public keys still match; otherwise
+		// fail closed so the previous (self-consistent) state is kept.
+		newPub, ok := certAndKey.Leaf.PublicKey.(pkcs11PublicKey)
+		if !ok {
+			return fmt.Errorf("pkcs11: unsupported public key type %T in certificate %q", certAndKey.Leaf.PublicKey, c.certificatePath)
+		}
+		if old.Leaf == nil || !newPub.Equal(old.Leaf.PublicKey) {
+			return fmt.Errorf("pkcs11: refusing to reload certificate %q: its public key does not match the cached HSM private key", c.certificatePath)
+		}
+		c.logger.Printf("pkcs11: reusing previously cached private key handle from module")
 		certAndKey.PrivateKey = old.PrivateKey
 	} else {
+		c.logger.Printf("pkcs11: loading private key for given certificate from module")
 		privateKey, err := pkcs11key.New(c.modulePath, c.tokenLabel, c.pin, certAndKey.Leaf.PublicKey)
 		if err != nil {
-			return err
+			return fmt.Errorf("pkcs11: unable to load private key from module %q (token %q): %w", c.modulePath, c.tokenLabel, err)
 		}
 		certAndKey.PrivateKey = privateKey
 	}
 
 	bundle, err := LoadTrustStore(c.caBundlePath)
 	if err != nil {
-		return err
+		return fmt.Errorf("loading trust store: %w", err)
 	}
 
-	atomic.StorePointer(&c.cachedCertificate, unsafe.Pointer(&certAndKey))
-	atomic.StorePointer(&c.cachedCertPool, unsafe.Pointer(bundle))
+	c.cachedCertificate.Store(&certAndKey)
+	c.cachedCertPool.Store(bundle)
 
 	return nil
-}
-
-// GetCertificate retrieves the actual underlying tls.Certificate.
-func (c *pkcs11Certificate) GetCertificate(clientHello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-	return (*tls.Certificate)(atomic.LoadPointer(&c.cachedCertificate)), nil
-}
-
-// GetClientCertificate retrieves the actual underlying tls.Certificate.
-func (c *pkcs11Certificate) GetClientCertificate(certInfo *tls.CertificateRequestInfo) (*tls.Certificate, error) {
-	return (*tls.Certificate)(atomic.LoadPointer(&c.cachedCertificate)), nil
-}
-
-// GetTrustStore returns the most up-to-date version of the trust store / CA bundle.
-func (c *pkcs11Certificate) GetTrustStore() *x509.CertPool {
-	return (*x509.CertPool)(atomic.LoadPointer(&c.cachedCertPool))
 }

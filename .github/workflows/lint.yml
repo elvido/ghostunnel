@@ -4,15 +4,21 @@ name: Lint
 on:
   pull_request:
     branches: [ master ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   golangci:
     name: Lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v2
-      - name: golangci-lint
-        uses: golangci/golangci-lint-action@v2
+      - name: Checkout
+        uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
-          version: v1.39
-          only-new-issues: true
+          go-version: stable
+          cache: false
+      - name: golangci-lint
+        run: go tool mage go:lint

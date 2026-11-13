@@ -1,4 +1,4 @@
-// +build darwin windows
+//go:build cgo && (darwin || windows)
 
 /*-
  * Copyright 2018 Square Inc.
@@ -21,39 +21,48 @@ package certloader
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
+	"log"
 	"sort"
-	"sync/atomic"
-	"unsafe"
 
-	"github.com/github/certstore"
+	"github.com/ghostunnel/ghostunnel/certstore"
 )
 
 type certstoreCertificate struct {
-	// Common name of keychain identity
-	commonName string
+	baseCertificate
+	// Common name or serial number of keychain identity
+	commonNameOrSerial string
+	// Issuer name of keychain identity
+	issuerName string
 	// Root CA bundle path
 	caBundlePath string
 	// Require use of hardware token?
 	requireToken bool
-	// Cached *tls.Certificate
-	cachedCertificate unsafe.Pointer
-	// Cached *x509.CertPool
-	cachedCertPool unsafe.Pointer
+	// Added logger, useful for certstore logging
+	logger *log.Logger
+	// openStore allows injecting a custom store opener for testing.
+	// If nil, defaults to certstore.Open.
+	openStore func(*log.Logger) (certstore.Store, error)
 }
 
 // SupportsKeychain returns true or false, depending on whether the
-// binary was built with Certstore/Keychain support or not (requires CGO, recent
-// Darwin to build).
+// binary was built with Certstore/Keychain support or not (requires CGO,
+// recent Darwin to build).
 func SupportsKeychain() bool {
 	return true
 }
 
 // CertificateFromKeychainIdentity creates a reloadable certificate from a system keychain identity.
-func CertificateFromKeychainIdentity(commonName string, caBundlePath string, requireToken bool) (Certificate, error) {
+func CertificateFromKeychainIdentity(
+	commonNameOrSerial string, issuerName string, caBundlePath string, requireToken bool, logger *log.Logger,
+) (Certificate, error) {
 	c := certstoreCertificate{
-		commonName:   commonName,
-		caBundlePath: caBundlePath,
+		commonNameOrSerial: commonNameOrSerial,
+		issuerName:         issuerName,
+		caBundlePath:       caBundlePath,
+		requireToken:       requireToken,
+		logger:             logger,
 	}
 	err := c.Reload()
 	if err != nil {
@@ -64,10 +73,16 @@ func CertificateFromKeychainIdentity(commonName string, caBundlePath string, req
 
 // Reload transparently reloads the certificate.
 func (c *certstoreCertificate) Reload() error {
-	store, err := certstore.Open()
+	opener := c.openStore
+	if opener == nil {
+		opener = certstore.Open
+	}
+
+	store, err := opener(c.logger)
 	if err != nil {
 		return err
 	}
+	defer store.Close()
 
 	flags := 0
 	if c.requireToken {
@@ -79,8 +94,23 @@ func (c *certstoreCertificate) Reload() error {
 		return err
 	}
 
-	// filter any certificates with the matching name, as the keychain allows
-	// multiple certificates with the same name
+	// Close every enumerated identity except the one we choose to serve. The
+	// chosen identity's Signer backs the live tls.Certificate, so it must stay
+	// open; everything else (non-matching identities, non-chosen candidates,
+	// and — on every error path — the chosen candidate too) leaks native
+	// handles unless closed here. chosenIdentity is assigned only on the final
+	// success path, so all error paths close all identities.
+	var chosenIdentity certstore.Identity
+	defer func() {
+		for _, identity := range identities {
+			if identity != chosenIdentity {
+				identity.Close()
+			}
+		}
+	}()
+
+	// Filter any certificates with the matching serial/name/issuer,
+	// as the keychain allows multiple certificates with the same name.
 	var candidates []certstore.Identity
 	for _, identity := range identities {
 		chain, err := identity.CertificateChain()
@@ -88,13 +118,35 @@ func (c *certstoreCertificate) Reload() error {
 			continue
 		}
 
-		if chain[0].Subject.CommonName == c.commonName {
-			candidates = append(candidates, identity)
+		hasIdentityFilter := c.commonNameOrSerial != ""
+		hasIssuerFilter := c.issuerName != ""
+
+		commonNameOrSerialMatches := hasIdentityFilter &&
+			(chain[0].SerialNumber.String() == c.commonNameOrSerial ||
+				chain[0].Subject.CommonName == c.commonNameOrSerial)
+
+		issuerNameMatches := hasIssuerFilter &&
+			chain[0].Issuer.CommonName == c.issuerName
+
+		if hasIdentityFilter && hasIssuerFilter {
+			// Both filters specified: require both to match, to support
+			// e.g. two certs with the same name but from different issuers.
+			if commonNameOrSerialMatches && issuerNameMatches {
+				candidates = append(candidates, identity)
+			}
+		} else if hasIdentityFilter {
+			if commonNameOrSerialMatches {
+				candidates = append(candidates, identity)
+			}
+		} else if hasIssuerFilter {
+			if issuerNameMatches {
+				candidates = append(candidates, identity)
+			}
 		}
 	}
 
 	if len(candidates) == 0 {
-		return fmt.Errorf("unable to find identity with common name '%s' in keychain", c.commonName)
+		return errors.New("unable to find identity in keychain, check requested name/issuer")
 	}
 
 	// sort the candidates by descending NotAfter
@@ -114,14 +166,14 @@ func (c *certstoreCertificate) Reload() error {
 
 	// choose the certificate with the NotAfter furthest in the future, which is
 	// the first item after the sort
-	chosenIdentity := candidates[0]
-	chain, err := chosenIdentity.CertificateChain()
+	chosen := candidates[0]
+	chain, err := chosen.CertificateChain()
 	if err != nil {
-		return fmt.Errorf("unable to find identity with common name '%s' in keychain", c.commonName)
+		return fmt.Errorf("unable to read identity from keychain: %w", err)
 	}
-	signer, err := chosenIdentity.Signer()
+	signer, err := chosen.Signer()
 	if err != nil {
-		return fmt.Errorf("unable to find identity with common name '%s' in keychain", c.commonName)
+		return fmt.Errorf("unable to read identity from keychain: %w", err)
 	}
 
 	certAndKey := &tls.Certificate{
@@ -132,27 +184,15 @@ func (c *certstoreCertificate) Reload() error {
 
 	bundle, err := LoadTrustStore(c.caBundlePath)
 	if err != nil {
-		return err
+		return fmt.Errorf("loading trust store: %w", err)
 	}
 
-	atomic.StorePointer(&c.cachedCertificate, unsafe.Pointer(certAndKey))
-	atomic.StorePointer(&c.cachedCertPool, unsafe.Pointer(bundle))
+	// Retain the chosen identity so the deferred cleanup does not close it.
+	chosenIdentity = chosen
+
+	c.cachedCertificate.Store(certAndKey)
+	c.cachedCertPool.Store(bundle)
 	return nil
-}
-
-// GetCertificate retrieves the actual underlying tls.Certificate.
-func (c *certstoreCertificate) GetCertificate(clientHello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-	return (*tls.Certificate)(atomic.LoadPointer(&c.cachedCertificate)), nil
-}
-
-// GetClientCertificate retrieves the actual underlying tls.Certificate.
-func (c *certstoreCertificate) GetClientCertificate(certInfo *tls.CertificateRequestInfo) (*tls.Certificate, error) {
-	return (*tls.Certificate)(atomic.LoadPointer(&c.cachedCertificate)), nil
-}
-
-// GetTrustStore returns the most up-to-date version of the trust store / CA bundle.
-func (c *certstoreCertificate) GetTrustStore() *x509.CertPool {
-	return (*x509.CertPool)(atomic.LoadPointer(&c.cachedCertPool))
 }
 
 func serializeChain(chain []*x509.Certificate) [][]byte {

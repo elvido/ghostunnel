@@ -14,14 +14,16 @@
  * limitations under the License.
  */
 
+//nolint:errcheck
 package main
 
 import (
 	"crypto/tls"
 	"encoding/base64"
-	"io/ioutil"
+	"log"
 	"os"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -180,17 +182,43 @@ hHV17et3tJKiSuKwz1wSwx7J5hxxPB38+GhfstzSde5LwuAFTfAn
 
 var testKeystorePassword = "password"
 
+func TestParseTLSVersion(t *testing.T) {
+	tests := []struct {
+		version    string
+		expected   uint16
+		shouldFail bool
+	}{
+		{"TLS1.2", tls.VersionTLS12, false},
+		{"TLS1.3", tls.VersionTLS13, false},
+		{"SSL3.0", 0, true},
+		{"TLS1.0", 0, true},
+		{"TLS1.1", 0, true},
+		{"invalid", 0, true},
+		{"", 0, true},
+	}
+
+	for _, test := range tests {
+		version, err := parseTLSVersion(test.version)
+		if test.shouldFail {
+			assert.Error(t, err, "parseTLSVersion(%s) should fail", test.version)
+		} else {
+			assert.NoError(t, err, "parseTLSVersion(%s) should not fail", test.version)
+			assert.Equal(t, test.expected, version, "parseTLSVersion(%s) returned wrong version", test.version)
+		}
+	}
+}
+
 func TestBuildConfig(t *testing.T) {
-	tmpKeystore, err := ioutil.TempFile("", "ghostunnel-test")
+	tmpKeystore, err := os.CreateTemp("", "ghostunnel-test")
 	panicOnError(err)
 
-	tmpKeystoreNoPrivKey, err := ioutil.TempFile("", "ghostunnel-test")
+	tmpKeystoreNoPrivKey, err := os.CreateTemp("", "ghostunnel-test")
 	panicOnError(err)
 
-	tmpKeystoreSeparateCert, err := ioutil.TempFile("", "ghostunnel-test")
+	tmpKeystoreSeparateCert, err := os.CreateTemp("", "ghostunnel-test")
 	panicOnError(err)
 
-	tmpKeystoreSeparateKey, err := ioutil.TempFile("", "ghostunnel-test")
+	tmpKeystoreSeparateKey, err := os.CreateTemp("", "ghostunnel-test")
 	panicOnError(err)
 
 	tmpKeystore.Write(testKeystore)
@@ -209,71 +237,295 @@ func TestBuildConfig(t *testing.T) {
 	defer os.Remove(tmpKeystoreSeparateCert.Name())
 	defer os.Remove(tmpKeystoreSeparateKey.Name())
 
-	_, err = buildConfig("")
-	assert.NotNil(t, err, "should fail to build config with no cipher suites")
+	_, err = buildConfig("", "", false, "")
+	assert.Error(t, err, "should fail to build config with no cipher suites")
 
-	conf, err := buildConfig("AES,CHACHA")
-	assert.Nil(t, err, "should be able to build TLS config")
-	assert.True(t, conf.MinVersion == tls.VersionTLS12, "must have correct TLS min version")
+	conf, err := buildConfig("AES,CHACHA", "", false, "")
+	assert.NoError(t, err, "should be able to build TLS config")
+	assert.Equal(t, uint16(tls.VersionTLS12), conf.MinVersion, "must have correct TLS min version")
+	assert.Equal(t, uint16(0), conf.MaxVersion, "should not set MaxVersion when maxTLSVersion is empty")
+	assert.Nil(t, conf.NextProtos, "must have empty next protos")
 
-	cert, err := buildCertificate("", "", "", "", tmpKeystoreSeparateCert.Name())
+	conf, err = buildConfig("AES,CHACHA", "TLS1.3", false, "")
+	assert.NoError(t, err, "should be able to build TLS config")
+	assert.Equal(t, uint16(tls.VersionTLS13), conf.MaxVersion, "must have correct TLS max version")
+
+	_, err = buildConfig("AES,CHACHA", "invalid", false, "")
+	assert.Error(t, err, "should fail to build config with invalid TLS version")
+	assert.Contains(t, err.Error(), "invalid max TLS version", "error should mention invalid TLS version")
+	assert.Equal(t, 1, strings.Count(err.Error(), "TLS version"), "error should not repeat \"TLS version\"")
+	assert.Contains(t, err.Error(), `"invalid"`, "error should quote the user-supplied version")
+
+	conf, err = buildConfig("AES,CHACHA", "", false, "h3,h2,http/1.1")
+	assert.NoError(t, err, "should be able to build TLS config with next protos")
+	assert.Equal(t, []string{"h3", "h2", "http/1.1"}, conf.NextProtos, "must have correct list of next protos")
+
+	conf, err = buildConfig("AES,CHACHA", "", false, " h2 , http/1.1 ")
+	assert.NoError(t, err, "should be able to build TLS config with padded next protos")
+	assert.Equal(t, []string{"h2", "http/1.1"}, conf.NextProtos, "must trim whitespace around next protos")
+
+	// An empty entry is worse than useless: crypto/tls rejects it on every
+	// client handshake, and a server would just never negotiate it.
+	_, err = buildConfig("AES,CHACHA", "", false, "h2,,http/1.1")
+	assert.Error(t, err, "should fail to build config with an empty next proto")
+	assert.Contains(t, err.Error(), "--alpn", "error should mention the --alpn flag")
+
+	_, err = buildConfig("AES,CHACHA", "", false, "h2,")
+	assert.Error(t, err, "should fail to build config with a trailing comma in next protos")
+
+	_, err = buildConfig("AES,CHACHA", "", false, " ")
+	assert.Error(t, err, "should fail to build config with a whitespace-only next proto")
+
+	_, err = buildConfig("AES,CHACHA", "", false, strings.Repeat("x", maxALPNProtocolLength+1))
+	assert.Error(t, err, "should fail to build config with an over-long next proto")
+	assert.Contains(t, err.Error(), "255 bytes", "error should mention the maximum length")
+
+	conf, err = buildConfig("AES,CHACHA", "", false, strings.Repeat("x", maxALPNProtocolLength))
+	assert.NoError(t, err, "should be able to build TLS config with a maximum-length next proto")
+	assert.Len(t, conf.NextProtos, 1, "must keep the maximum-length next proto")
+
+	// The reserved ACME challenge protocol would make the proxy blackhole
+	// every connection that negotiates it, so it must be rejected up front.
+	_, err = buildConfig("AES,CHACHA", "", false, "h2,acme-tls/1")
+	assert.Error(t, err, "should fail to build config with the reserved ACME protocol")
+	assert.Contains(t, err.Error(), "acme-tls/1", "error should mention the reserved protocol")
+
+	logger := log.New(os.Stdout, "", log.LstdFlags|log.Lmicroseconds)
+	cert, err := buildCertificate("", "", "", "", tmpKeystoreSeparateCert.Name(), logger)
 	assert.NotNil(t, cert, "cert with empty keystorePath should not be nil")
-	assert.Nil(t, err, "empty keystorePath should not raise an error")
+	assert.NoError(t, err, "empty keystorePath should not raise an error")
 
-	cert, err = buildCertificate(tmpKeystore.Name(), "", "", "totes invalid", tmpKeystoreSeparateCert.Name())
+	cert, err = buildCertificate(tmpKeystore.Name(), "", "", "totes invalid", tmpKeystoreSeparateCert.Name(), logger)
 	assert.Nil(t, cert, "cert with invalid params should be nil")
-	assert.NotNil(t, err, "should reject invalid keystore pass")
+	assert.Error(t, err, "should reject invalid keystore pass")
 
-	cert, err = buildCertificate("does-not-exist", "", "", testKeystorePassword, tmpKeystoreSeparateCert.Name())
+	cert, err = buildCertificate("does-not-exist", "", "", testKeystorePassword, tmpKeystoreSeparateCert.Name(), logger)
 	assert.Nil(t, cert, "cert with invalid params should be nil")
-	assert.NotNil(t, err, "should reject missing keystore (not found)")
+	assert.Error(t, err, "should reject missing keystore (not found)")
 
-	cert, err = buildCertificate(tmpKeystoreNoPrivKey.Name(), "", "", "", tmpKeystoreSeparateCert.Name())
+	cert, err = buildCertificate(tmpKeystoreNoPrivKey.Name(), "", "", "", tmpKeystoreSeparateCert.Name(), logger)
 	assert.Nil(t, cert, "cert with invalid params should be nil")
-	assert.NotNil(t, err, "should reject invalid keystore (no private key)")
+	assert.Error(t, err, "should reject invalid keystore (no private key)")
 
-	cert, err = buildCertificate("/dev/null", "", "", "", tmpKeystoreSeparateCert.Name())
+	cert, err = buildCertificate("/dev/null", "", "", "", tmpKeystoreSeparateCert.Name(), logger)
 	assert.Nil(t, cert, "cert with invalid params should be nil")
-	assert.NotNil(t, err, "should reject invalid keystore (empty)")
+	assert.Error(t, err, "should reject invalid keystore (empty)")
 
-	cert, err = buildCertificate("", tmpKeystoreSeparateCert.Name(), tmpKeystoreSeparateKey.Name(), "", tmpKeystoreSeparateCert.Name())
+	cert, err = buildCertificate("", tmpKeystoreSeparateCert.Name(), tmpKeystoreSeparateKey.Name(), "", tmpKeystoreSeparateCert.Name(), logger)
 	assert.NotNil(t, cert, "cert with separate key should not be nil")
-	assert.Nil(t, err, "cert with separate key should be ok")
+	assert.NoError(t, err, "cert with separate key should be ok")
+}
+
+func TestBuildClientConfig(t *testing.T) {
+	conf, err := buildClientConfig("AES,CHACHA", "", false, "")
+	assert.NoError(t, err, "should be able to build client TLS config")
+	assert.Equal(t, uint16(tls.VersionTLS12), conf.MinVersion, "must have correct TLS min version")
+
+	conf, err = buildClientConfig("AES,CHACHA", "TLS1.2", false, "")
+	assert.NoError(t, err, "should be able to build client TLS config with max version")
+	assert.Equal(t, uint16(tls.VersionTLS12), conf.MaxVersion, "must have correct max TLS version")
+
+	_, err = buildClientConfig("INVALID", "", false, "")
+	assert.Error(t, err, "should fail to build client config with invalid cipher suite")
+}
+
+// Client mode sets no ClientSessionCache, so its connections never resume and
+// VerifyPeerCertificateClient runs on every one of them. If a session cache is
+// ever added, this test fails and forces a decision about what should happen to
+// the verification that resumption would then skip — the server side answers
+// that with certloader.BindSessionsToGeneration.
+func TestClientConfigHasNoSessionCache(t *testing.T) {
+	conf, err := buildClientConfig("AES,CHACHA", "", false, "")
+	assert.NoError(t, err, "should be able to build client TLS config")
+	assert.Nil(t, conf.ClientSessionCache, "client config must not cache sessions")
+}
+
+func TestBuildServerConfig(t *testing.T) {
+	conf, err := buildServerConfig("AES,CHACHA", "", false, "")
+	assert.NoError(t, err, "should be able to build server TLS config")
+	assert.Equal(t, tls.RequireAndVerifyClientCert, conf.ClientAuth, "server config should require client cert")
+}
+
+func TestBuildCertificateKeystore(t *testing.T) {
+	tmpKeystore, err := os.CreateTemp("", "ghostunnel-test")
+	panicOnError(err)
+	tmpKeystore.Write(testKeystore)
+	tmpKeystore.Sync()
+	defer os.Remove(tmpKeystore.Name())
+
+	tmpCaBundle, err := os.CreateTemp("", "ghostunnel-test")
+	panicOnError(err)
+	tmpCaBundle.WriteString(testCertificate)
+	tmpCaBundle.Sync()
+	defer os.Remove(tmpCaBundle.Name())
+
+	logger := log.New(os.Stdout, "", log.LstdFlags|log.Lmicroseconds)
+
+	// Test the keystore branch
+	cert, err := buildCertificate(tmpKeystore.Name(), "", "", testKeystorePassword, tmpCaBundle.Name(), logger)
+	assert.NotNil(t, cert, "cert from keystore should not be nil")
+	assert.NoError(t, err, "should load cert from keystore")
+}
+
+func TestBuildCertificateNoCert(t *testing.T) {
+	tmpCaBundle, err := os.CreateTemp("", "ghostunnel-test")
+	panicOnError(err)
+	tmpCaBundle.WriteString(testCertificate)
+	tmpCaBundle.Sync()
+	defer os.Remove(tmpCaBundle.Name())
+
+	logger := log.New(os.Stdout, "", log.LstdFlags|log.Lmicroseconds)
+
+	// Test the no-cert fallback
+	cert, err := buildCertificate("", "", "", "", tmpCaBundle.Name(), logger)
+	assert.NotNil(t, cert, "no-cert certificate should not be nil")
+	assert.NoError(t, err, "no-cert should not raise an error")
 }
 
 func TestCipherSuitePreference(t *testing.T) {
-	conf, err := buildConfig("XYZ")
-	assert.NotNil(t, err, "should not be able to build TLS config with invalid cipher suite option")
+	_, err := buildConfig("XYZ", "TLS1.3", false, "")
+	assert.Error(t, err, "should not be able to build TLS config with invalid cipher suite option")
 
-	_, err = buildServerConfig("XYZ")
-	assert.NotNil(t, err, "should not be able to build TLS config with invalid cipher suite option")
+	_, err = buildServerConfig("XYZ", "TLS1.3", false, "")
+	assert.Error(t, err, "should not be able to build server TLS config with invalid cipher suite option")
 
-	conf, err = buildConfig("")
-	assert.NotNil(t, err, "should not be able to build TLS config wihout cipher suite selection")
+	_, err = buildConfig("", "TLS1.3", false, "")
+	assert.Error(t, err, "should not be able to build TLS config without cipher suite selection")
 
-	conf, err = buildConfig("CHACHA,AES")
-	assert.Nil(t, err, "should be able to build TLS config")
-	assert.True(t, conf.CipherSuites[0] == tls.TLS_CHACHA20_POLY1305_SHA256, "expecting TLS 1.3 ChaCha20")
+	conf, err := buildConfig("CHACHA,AES", "TLS1.3", false, "")
+	assert.NoError(t, err, "should be able to build TLS config")
+	assert.Equal(t, tls.TLS_CHACHA20_POLY1305_SHA256, conf.CipherSuites[0], "expecting TLS 1.3 ChaCha20")
 
-	conf, err = buildConfig("AES,CHACHA")
-	assert.Nil(t, err, "should be able to build TLS config")
-	assert.True(t, conf.CipherSuites[0] == tls.TLS_AES_128_GCM_SHA256, "expecting TLS 1.3 AES")
+	conf, err = buildConfig("AES,CHACHA", "TLS1.3", false, "")
+	assert.NoError(t, err, "should be able to build TLS config")
+	assert.Equal(t, tls.TLS_AES_128_GCM_SHA256, conf.CipherSuites[0], "expecting TLS 1.3 AES")
 
-	conf, err = buildConfig("AES,CHACHA,UNSAFE-AZURE")
-	assert.NotNil(t, err, "should not be able to build TLS config with unsafe cipher suite without flag")
+	_, err = buildConfig("AES,CHACHA,UNSAFE-AZURE", "TLS1.3", false, "")
+	assert.Error(t, err, "should not be able to build TLS config with unsafe cipher suite without flag")
 
-	*allowUnsafeCipherSuites = true
-	conf, err = buildConfig("UNSAFE-AZURE")
-	assert.Nil(t, err, "should be able to build TLS config")
-	assert.True(t, conf.CipherSuites[0] == tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256, "expecting AES")
-	*allowUnsafeCipherSuites = false
+	conf, err = buildConfig("UNSAFE-AZURE", "TLS1.3", true, "")
+	assert.NoError(t, err, "should be able to build TLS config")
+	assert.Equal(t, tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256, conf.CipherSuites[0], "expecting AES")
+}
+
+// TestResolveCipherSuites exercises the shared helper used by both
+// validateCipherSuites and buildConfig. The helper is the single source of
+// truth for cipher-suite parsing/lookup, so these cases lock its behavior in.
+func TestResolveCipherSuites(t *testing.T) {
+	// Known safe group resolves.
+	suites, err := resolveCipherSuites("AES", false)
+	assert.NoError(t, err, "AES group should resolve without unsafe flag")
+	assert.NotEmpty(t, suites, "AES group should yield non-empty suite list")
+
+	// Whitespace around names is trimmed.
+	suites, err = resolveCipherSuites(" AES , CHACHA ", false)
+	assert.NoError(t, err, "names with surrounding whitespace should be trimmed")
+	assert.NotEmpty(t, suites)
+
+	// Unknown group is rejected.
+	_, err = resolveCipherSuites("XYZ", false)
+	assert.Error(t, err, "unknown group should be rejected")
+
+	// Empty spec yields the empty-name lookup which is rejected.
+	_, err = resolveCipherSuites("", false)
+	assert.Error(t, err, "empty spec should be rejected")
+
+	// Unsafe group requires the explicit allowUnsafe flag.
+	_, err = resolveCipherSuites("UNSAFE-AZURE", false)
+	assert.Error(t, err, "unsafe group should be rejected when allowUnsafe=false")
+
+	suites, err = resolveCipherSuites("UNSAFE-AZURE", true)
+	assert.NoError(t, err, "unsafe group should resolve when allowUnsafe=true")
+	assert.Equal(t, []uint16{tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256}, suites)
+
+	// Mixing safe and unsafe names: still requires the flag.
+	_, err = resolveCipherSuites("AES,UNSAFE-AZURE", false)
+	assert.Error(t, err, "mixed safe+unsafe should be rejected without flag")
+
+	suites, err = resolveCipherSuites("AES,UNSAFE-AZURE", true)
+	assert.NoError(t, err, "mixed safe+unsafe should resolve with flag")
+	assert.Contains(t, suites, tls.TLS_AES_128_GCM_SHA256)
+	assert.Contains(t, suites, tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256)
+}
+
+// TestValidateCipherSuitesMatchesBuildConfig pins the invariant that
+// validateCipherSuites and buildConfig accept/reject the exact same inputs.
+// Both call resolveCipherSuites under the hood; if either ever diverges this
+// test will catch it.
+func TestValidateCipherSuitesMatchesBuildConfig(t *testing.T) {
+	origSpec := *enabledCipherSuites
+	origUnsafe := *allowUnsafeCipherSuites
+	defer func() {
+		*enabledCipherSuites = origSpec
+		*allowUnsafeCipherSuites = origUnsafe
+	}()
+
+	cases := []struct {
+		spec        string
+		allowUnsafe bool
+	}{
+		{"AES", false},
+		{"AES,CHACHA", false},
+		{"XYZ", false},
+		{"", false},
+		{"UNSAFE-AZURE", false},
+		{"UNSAFE-AZURE", true},
+		{"AES,UNSAFE-AZURE", false},
+		{"AES,UNSAFE-AZURE", true},
+		{" AES , CHACHA ", false},
+	}
+	for _, tc := range cases {
+		*enabledCipherSuites = tc.spec
+		*allowUnsafeCipherSuites = tc.allowUnsafe
+
+		validateErr := validateCipherSuites()
+		_, buildErr := buildConfig(tc.spec, "", tc.allowUnsafe, "")
+
+		assert.Equal(t,
+			validateErr == nil, buildErr == nil,
+			"validateCipherSuites and buildConfig must agree for spec=%q allowUnsafe=%v (validateErr=%v buildErr=%v)",
+			tc.spec, tc.allowUnsafe, validateErr, buildErr)
+	}
+}
+
+func TestValidateALPNMatchesBuildConfig(t *testing.T) {
+	origALPN := *alpn
+	defer func() {
+		*alpn = origALPN
+	}()
+
+	cases := []string{
+		"",
+		"h2",
+		"h2,http/1.1",
+		" h2 , http/1.1 ",
+		"h2,,http/1.1",
+		"h2,",
+		",h2",
+		" ",
+		strings.Repeat("x", maxALPNProtocolLength),
+		strings.Repeat("x", maxALPNProtocolLength+1),
+		"acme-tls/1",
+		"h2,acme-tls/1",
+	}
+	for _, spec := range cases {
+		*alpn = spec
+
+		validateErr := validateALPN()
+		_, buildErr := buildConfig("AES,CHACHA", "", false, spec)
+
+		assert.Equal(t,
+			validateErr == nil, buildErr == nil,
+			"validateALPN and buildConfig must agree for spec=%q (validateErr=%v buildErr=%v)",
+			spec, validateErr, buildErr)
+	}
 }
 
 func TestReload(t *testing.T) {
-	tmpKeystore, err := ioutil.TempFile("", "ghostunnel-test")
+	tmpKeystore, err := os.CreateTemp("", "ghostunnel-test")
 	panicOnError(err)
 
-	tmpCaBundle, err := ioutil.TempFile("", "ghostunnel-test")
+	tmpCaBundle, err := os.CreateTemp("", "ghostunnel-test")
 	panicOnError(err)
 
 	tmpCaBundle.WriteString(testCertificate)
@@ -285,10 +537,111 @@ func TestReload(t *testing.T) {
 	defer os.Remove(tmpCaBundle.Name())
 	defer os.Remove(tmpKeystore.Name())
 
-	c, err := buildCertificate(tmpKeystore.Name(), "", "", testKeystorePassword, tmpCaBundle.Name())
-	assert.Nil(t, err, "should be able to build certificate")
+	logger := log.New(os.Stdout, "", log.LstdFlags|log.Lmicroseconds)
+	c, err := buildCertificate(tmpKeystore.Name(), "", "", testKeystorePassword, tmpCaBundle.Name(), logger)
+	assert.NoError(t, err, "should be able to build certificate")
 
 	c.Reload()
+}
+
+func TestBuildCertificateHasPKCS11WithKeystorePath(t *testing.T) {
+	// Save and restore global state
+	origPkcs11Module := pkcs11Module
+	origKeychainIdentity := keychainIdentity
+	defer func() {
+		pkcs11Module = origPkcs11Module
+		keychainIdentity = origKeychainIdentity
+	}()
+
+	// Set up PKCS#11 module to a non-existent path
+	nonExistentModule := "/nonexistent/pkcs11-module.so"
+	pkcs11Module = &nonExistentModule
+	keychainIdentity = nil
+
+	logger := log.New(os.Stdout, "", log.LstdFlags|log.Lmicroseconds)
+
+	tmpCaBundle, err := os.CreateTemp("", "ghostunnel-test")
+	panicOnError(err)
+	tmpCaBundle.WriteString(testCertificate)
+	tmpCaBundle.Sync()
+	defer os.Remove(tmpCaBundle.Name())
+
+	// Test PKCS#11 branch with keystorePath set (line 60-61)
+	_, err = buildCertificate("keystore.p12", "", "", "", tmpCaBundle.Name(), logger)
+	assert.Error(t, err, "should fail with non-existent PKCS11 module via keystorePath")
+}
+
+func TestBuildCertificateHasPKCS11WithCertPath(t *testing.T) {
+	// Save and restore global state
+	origPkcs11Module := pkcs11Module
+	origKeychainIdentity := keychainIdentity
+	defer func() {
+		pkcs11Module = origPkcs11Module
+		keychainIdentity = origKeychainIdentity
+	}()
+
+	// Set up PKCS#11 module to a non-existent path
+	nonExistentModule := "/nonexistent/pkcs11-module.so"
+	pkcs11Module = &nonExistentModule
+	keychainIdentity = nil
+
+	logger := log.New(os.Stdout, "", log.LstdFlags|log.Lmicroseconds)
+
+	tmpCaBundle, err := os.CreateTemp("", "ghostunnel-test")
+	panicOnError(err)
+	tmpCaBundle.WriteString(testCertificate)
+	tmpCaBundle.Sync()
+	defer os.Remove(tmpCaBundle.Name())
+
+	tmpCert, err := os.CreateTemp("", "ghostunnel-test")
+	panicOnError(err)
+	tmpCert.WriteString(testKeystoreCertOnly)
+	tmpCert.Sync()
+	defer os.Remove(tmpCert.Name())
+
+	// Test PKCS#11 branch with certPath set (line 63)
+	_, err = buildCertificate("", tmpCert.Name(), "", "", tmpCaBundle.Name(), logger)
+	assert.Error(t, err, "should fail with non-existent PKCS11 module via certPath")
+}
+
+func TestBuildCertificateHasKeychainIdentityError(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "windows" {
+		t.Skip("keychain identity only supported on darwin/windows")
+	}
+
+	// Save and restore global state
+	origPkcs11Module := pkcs11Module
+	origKeychainIdentity := keychainIdentity
+	origKeychainIssuer := keychainIssuer
+	origKeychainRequireToken := keychainRequireToken
+	defer func() {
+		pkcs11Module = origPkcs11Module
+		keychainIdentity = origKeychainIdentity
+		keychainIssuer = origKeychainIssuer
+		keychainRequireToken = origKeychainRequireToken
+	}()
+
+	// Ensure PKCS11 is disabled, enable keychain
+	emptyStr := ""
+	pkcs11Module = &emptyStr
+	nonExistentIdentity := "nonexistent-identity-12345"
+	keychainIdentity = &nonExistentIdentity
+	nonExistentIssuer := "nonexistent-issuer-67890"
+	keychainIssuer = &nonExistentIssuer
+	falseVal := false
+	keychainRequireToken = &falseVal
+
+	logger := log.New(os.Stdout, "", log.LstdFlags|log.Lmicroseconds)
+
+	tmpCaBundle, err := os.CreateTemp("", "ghostunnel-test")
+	panicOnError(err)
+	tmpCaBundle.WriteString(testCertificate)
+	tmpCaBundle.Sync()
+	defer os.Remove(tmpCaBundle.Name())
+
+	// Test keychain branch (line 66-68)
+	_, err = buildCertificate("", "", "", "", tmpCaBundle.Name(), logger)
+	assert.Error(t, err, "should fail with non-existent keychain identity")
 }
 
 func TestBuildConfigSystemRoots(t *testing.T) {
@@ -298,7 +651,7 @@ func TestBuildConfigSystemRoots(t *testing.T) {
 		return
 	}
 
-	tmpKeystore, err := ioutil.TempFile("", "ghostunnel-test")
+	tmpKeystore, err := os.CreateTemp("", "ghostunnel-test")
 	panicOnError(err)
 
 	tmpKeystore.Write(testKeystore)
@@ -306,8 +659,9 @@ func TestBuildConfigSystemRoots(t *testing.T) {
 
 	defer os.Remove(tmpKeystore.Name())
 
-	c, err := buildCertificate(tmpKeystore.Name(), "", "", testKeystorePassword, "")
-	assert.Nil(t, err, "should be able to build certificate")
+	logger := log.New(os.Stdout, "", log.LstdFlags|log.Lmicroseconds)
+	c, err := buildCertificate(tmpKeystore.Name(), "", "", testKeystorePassword, "", logger)
+	assert.NoError(t, err, "should be able to build certificate")
 
 	c.Reload()
 }

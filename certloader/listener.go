@@ -21,17 +21,17 @@ import (
 	"net"
 )
 
-// Listener holds a *net.Listener, wrapping incoming connections in TLS,
-// overriding Accept() to make sure we reload the trust bundle on new incoming
-// connections. This allows for reloading the CA bundle at runtime without
+// Listener embeds a net.Listener and wraps each accepted connection in TLS.
+// Accept fetches the current server config for every connection, so a reload
+// of the certificate or trust store takes effect for new connections without
 // restarting the listener.
 type Listener struct {
 	net.Listener
 
-	cert   Certificate
 	config TLSServerConfig
 }
 
+// NewListener creates a new TLS listener that wraps the given net.Listener.
 func NewListener(listener net.Listener, config TLSServerConfig) *Listener {
 	return &Listener{
 		Listener: listener,
@@ -39,6 +39,7 @@ func NewListener(listener net.Listener, config TLSServerConfig) *Listener {
 	}
 }
 
+// Accept waits for and returns the next TLS-wrapped connection to the listener.
 func (l *Listener) Accept() (net.Conn, error) {
 	c, err := l.Listener.Accept()
 	if err != nil {

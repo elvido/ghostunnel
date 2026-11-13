@@ -1,25 +1,32 @@
-# Dockerfile for running integration tests, includes PKCS11/SoftHSM setup. 
-# 
+# Dockerfile for running integration tests, includes PKCS11/SoftHSM setup.
+#
 # Build image:
-#     docker build --build-arg GO_VERSION=[VERSION] -t ghostunnel/ghostunnel-test -f Dockerfile-test .
+#     docker buildx build -t ghostunnel/ghostunnel-test -f Dockerfile-test .
 #
 # Run integration tests:
 #     docker run -v /dev/log:/dev/log -v $PWD:/go/src/github.com/ghostunnel/ghostunnel ghostunnel/ghostunnel-test
 
-ARG GO_VERSION
-
-FROM golang:${GO_VERSION}
+FROM golang:latest
 
 # Install build dependencies
 RUN apt-get update && \
-    apt-get install -y build-essential python3-minimal netcat softhsm2 rsyslog git python3-distutils </dev/null && \
+    apt-get install -y build-essential python3-minimal netcat-traditional softhsm2 rsyslog git openssl default-jre-headless </dev/null && \
     mkdir -p /etc/softhsm /var/lib/softhsm/tokens /go/src/github.com/ghostunnel/ghostunnel && \
-    go get github.com/wadey/gocovmerge && \
-    go get golang.org/x/tools/cmd/cover
+    go install golang.org/x/tools/cmd/cover@latest && \
+    go install github.com/magefile/mage@latest && \
+    go install github.com/letsencrypt/pebble/v2/cmd/pebble@latest
 
 WORKDIR /go/src/github.com/ghostunnel/ghostunnel
 
+# Mark workspace as safe for git — the volume mount at runtime may have
+# different ownership than the container user, which causes git (and
+# therefore go build with VCS stamping) to fail.
+RUN git config --global --add safe.directory /go/src/github.com/ghostunnel/ghostunnel
+
 ENV GO111MODULE=on
+
+# Copy source code
+COPY . /go/src/github.com/ghostunnel/ghostunnel
 
 # Setup SoftHSM for testing PKCS11 support
 # Instruct PKCS11 integration test to run
@@ -33,5 +40,12 @@ ENV GHOSTUNNEL_TEST_PKCS11_PIN=1234
 # Set SoftHSM config file
 ENV SOFTHSM2_CONF=/etc/softhsm/softhsm2.conf
 
-ENTRYPOINT ["/usr/bin/make"]
-CMD ["clean", "softhsm-import", "test"]
+# Add GOPATH/bin to PATH for mage (default GOPATH in golang images is /go)
+ENV PATH=$PATH:/go/bin
+
+# Redirect Python test fixtures (cert work dir, unix socket parents) out of
+# /tmp at container start so we exercise ghostunnel's per-address landlock
+# rules instead of riding on /tmp being in defaultReadWritePaths. A fresh
+# random dir per container run keeps repeated runs isolated.
+ENTRYPOINT ["sh", "-c", "export GHOSTUNNEL_TEST_TMPDIR=$(mktemp -d /var/ghostunnel-test-XXXXXX) && exec mage \"$@\"", "--"]
+CMD ["-v", "test:softhsmimport", "test:all"]

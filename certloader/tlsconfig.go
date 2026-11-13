@@ -20,7 +20,7 @@ import (
 	"crypto/tls"
 )
 
-// TLSConfig is used to configure client or server TLS. It supports hot reloading.
+// TLSConfigSource is used to configure client or server TLS. It supports hot reloading.
 type TLSConfigSource interface {
 	// Reload will reload the TLS configuration. If reloading fails, the
 	// existing configuration will be used. The client and server config
@@ -39,19 +39,29 @@ type TLSConfigSource interface {
 
 	// GetServerConfig returns a TLSServerConfig interface that can be used to
 	// obtain TLS server configuration. The base configuration is cloned and
-	// used as a base for all returned TLS configuration. If the TLSConfig is
-	// not appropriate for use as a server, false is returned.
+	// used as a base for all returned TLS configuration. If the source is
+	// not appropriate for use as a server, an error is returned.
 	GetServerConfig(base *tls.Config) (TLSServerConfig, error)
 }
 
+// TLSClientConfig is an interface for obtaining TLS client configuration.
 type TLSClientConfig interface {
 	// GetClientConfig returns a TLS configuration for use as a TLS client. It
 	// is safe to call concurrently.
 	GetClientConfig() *tls.Config
 }
 
+// TLSServerConfig is an interface for obtaining TLS server configuration.
 type TLSServerConfig interface {
 	// GetServerConfig returns a TLS configuration for use as a TLS server. It
 	// is safe to call concurrently.
+	//
+	// Implementations must never mutate a config they have already returned:
+	// callers fetch a config per connection (see Listener) and may still be
+	// handshaking with an earlier one. They should return the same pointer
+	// until the configuration changes, because BindSessionsToGeneration
+	// compares pointers to avoid cloning on every connection.
+	// WithoutACMEChallenge returns a new clone on every call, so it must not
+	// be wrapped by BindSessionsToGeneration.
 	GetServerConfig() *tls.Config
 }

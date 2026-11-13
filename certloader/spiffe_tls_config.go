@@ -19,55 +19,44 @@ package certloader
 import (
 	"context"
 	"crypto/tls"
-	"crypto/x509"
+	"fmt"
 	"log"
+	"sync/atomic"
+	"time"
 
-	"github.com/spiffe/go-spiffe/spiffe"
+	spiffeConfig "github.com/spiffe/go-spiffe/v2/spiffetls/tlsconfig"
+	spiffeApi "github.com/spiffe/go-spiffe/v2/workloadapi"
 )
 
 type spiffeTLSConfigSource struct {
-	peer *spiffe.TLSPeer
-	log  *log.Logger
+	client            *spiffeApi.Client
+	clientDisableAuth bool
+	initTimeout       time.Duration
+	logger            *log.Logger
 }
 
-type spiffeLogger struct {
-	log *log.Logger
-}
-
-func (l spiffeLogger) Debugf(format string, args ...interface{}) {
-	l.log.Printf("(spiffe) [DEBUG]: "+format, args...)
-}
-
-func (l spiffeLogger) Infof(format string, args ...interface{}) {
-	l.log.Printf("(spiffe) [INFO]: "+format, args...)
-}
-
-func (l spiffeLogger) Warnf(format string, args ...interface{}) {
-	l.log.Printf("(spiffe) [WARN]: "+format, args...)
-}
-
-func (l spiffeLogger) Errorf(format string, args ...interface{}) {
-	l.log.Printf("(spiffe) [ERROR]: "+format, args...)
-}
-
-func TLSConfigSourceFromWorkloadAPI(addr string, logger *log.Logger) (TLSConfigSource, error) {
-	peer, err := spiffe.NewTLSPeer(
-		spiffe.WithWorkloadAPIAddr(addr),
-		spiffe.WithLogger(spiffeLogger{log: logger}),
+// TLSConfigSourceFromWorkloadAPI creates a TLSConfigSource that uses the SPIFFE Workload API.
+// initTimeout bounds how long the first certificate fetch (NewX509Source) may block at startup.
+// A value of 0 (or negative) means wait indefinitely — the old behavior before the timeout was introduced.
+func TLSConfigSourceFromWorkloadAPI(addr string, clientDisableAuth bool, initTimeout time.Duration, logger *log.Logger) (TLSConfigSource, error) {
+	client, err := spiffeApi.New(
+		context.Background(),
+		spiffeApi.WithAddr(addr),
+		spiffeApi.WithLogger(spiffeLogger{log: logger}),
 	)
 	if err != nil {
 		return nil, err
 	}
-	// TODO: provide a way to close the peer on graceful shutdown
 	return &spiffeTLSConfigSource{
-		peer: peer,
-		log:  logger,
+		client:            client,
+		clientDisableAuth: clientDisableAuth,
+		initTimeout:       initTimeout,
+		logger:            logger,
 	}, nil
 }
 
 func (s *spiffeTLSConfigSource) Reload() error {
-	// The config returned by the workload TLSConfig maintains itself. Nothing
-	// to do here.
+	// The config returned by the workload API maintains itself. Nothing to do here.
 	return nil
 }
 
@@ -84,30 +73,62 @@ func (s *spiffeTLSConfigSource) GetServerConfig(base *tls.Config) (TLSServerConf
 }
 
 func (s *spiffeTLSConfigSource) Close() error {
-	return s.peer.Close()
+	return s.client.Close()
 }
 
 func (s *spiffeTLSConfigSource) newConfig(base *tls.Config) (*spiffeTLSConfig, error) {
-	s.log.Printf("waiting for initial SPIFFE Workload API update...")
-	if err := s.peer.WaitUntilReady(context.TODO()); err != nil {
-		return nil, err
+	// NewX509Source blocks until the first update is received from the Workload
+	// API. Bound that wait so an unreachable agent surfaces as an error instead
+	// of hanging forever. initTimeout <= 0 means wait indefinitely (no deadline).
+	ctx := context.Background()
+	if s.initTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, s.initTimeout)
+		defer cancel()
 	}
-	s.log.Printf("received SPIFFE Workload API update.")
+	source, err := spiffeApi.NewX509Source(ctx, spiffeApi.WithClient(s.client))
+	if err != nil {
+		return nil, fmt.Errorf("unable to obtain initial SPIFFE Workload API update (is the agent reachable and is there a registration entry?): %w", err)
+	}
 
 	return &spiffeTLSConfig{
-		base: base,
-		peer: s.peer,
+		base:              base,
+		source:            source,
+		clientDisableAuth: s.clientDisableAuth,
 	}, nil
 }
 
 type spiffeTLSConfig struct {
-	base *tls.Config
-	peer *spiffe.TLSPeer
+	base              *tls.Config
+	source            *spiffeApi.X509Source
+	clientDisableAuth bool
+
+	// Cached configs. SPIFFE has no reloadable trust store (the X509Source
+	// maintains itself via the Workload API and certificates are served through
+	// a callback), so the built config never changes: build once, cache forever.
+	//
+	// That means a reload never rebuilds these configs, and with them never
+	// rotates the session ticket keys, so nothing here invalidates outstanding
+	// sessions. Session invalidation is not this type's job: the server
+	// listener wraps whatever config it gets in
+	// BindSessionsToGeneration, which drops sessions on every reload
+	// regardless of what the source underneath it did.
+	cachedClient atomic.Pointer[tls.Config]
+	cachedServer atomic.Pointer[tls.Config]
 }
 
 func (c *spiffeTLSConfig) GetClientConfig() *tls.Config {
+	if cached := c.cachedClient.Load(); cached != nil {
+		return cached
+	}
+	config := c.buildClientConfig()
+	c.cachedClient.Store(config)
+	return config
+}
+
+func (c *spiffeTLSConfig) buildClientConfig() *tls.Config {
 	config := c.base.Clone()
-	// Go TLS stack will do hostname validation with is not a part of SPIFFE
+	// Go TLS stack will do hostname validation which is not a part of SPIFFE
 	// authentication. Unfortunately there is no way to just skip hostname
 	// validation without having to turn off all verification. This is still
 	// safe since Go will still invoke the VerifyPeerCertificate callback,
@@ -115,15 +136,35 @@ func (c *spiffeTLSConfig) GetClientConfig() *tls.Config {
 	// callback provided by the SPIFFE library will perform SPIFFE
 	// authentication against the raw certificates.
 	config.InsecureSkipVerify = true
-	config.VerifyPeerCertificate = c.chainVerifyPeerCertificate(config.VerifyPeerCertificate)
-	config.GetClientCertificate = spiffe.AdaptGetClientCertificate(c.peer)
+	config.VerifyPeerCertificate = spiffeConfig.WrapVerifyPeerCertificate(config.VerifyPeerCertificate, c.source, spiffeConfig.AuthorizeAny()) //nolint:gosec // G123: client configs set no ClientSessionCache, so these connections never resume and the check always runs.
+	if !c.clientDisableAuth {
+		// If auth is disabled on the client side we need to not set
+		// the GetCertificate callback, because if we do it'll cause
+		// the client to block forever if the SPIFFE Workload API
+		// doesn't have a client certificate available for us.
+		config.GetClientCertificate = spiffeConfig.GetClientCertificate(c.source)
+	}
 	return config
 }
 
 func (c *spiffeTLSConfig) GetServerConfig() *tls.Config {
+	if cached := c.cachedServer.Load(); cached != nil {
+		return cached
+	}
+	config := c.buildServerConfig()
+	c.cachedServer.Store(config)
+	return config
+}
+
+func (c *spiffeTLSConfig) buildServerConfig() *tls.Config {
 	config := c.base.Clone()
-	config.ClientAuth = tls.RequireAnyClientCert
-	// Go TLS stack will do hostname validation with is not a part of SPIFFE
+
+	if !c.clientDisableAuth {
+		// Only set client requirement if not disabled in base.
+		config.ClientAuth = tls.RequireAnyClientCert
+	}
+
+	// Go TLS stack will do hostname validation which is not a part of SPIFFE
 	// authentication. Unfortunately there is no way to just skip hostname
 	// validation without having to turn off all verification. This is still
 	// safe since Go will still invoke the VerifyPeerCertificate callback,
@@ -131,37 +172,7 @@ func (c *spiffeTLSConfig) GetServerConfig() *tls.Config {
 	// callback provided by the SPIFFE library will perform SPIFFE
 	// authentication against the raw certificates.
 	config.InsecureSkipVerify = true
-	config.VerifyPeerCertificate = c.chainVerifyPeerCertificate(config.VerifyPeerCertificate)
-	config.GetCertificate = spiffe.AdaptGetCertificate(c.peer)
+	config.VerifyPeerCertificate = spiffeConfig.WrapVerifyPeerCertificate(config.VerifyPeerCertificate, c.source, spiffeConfig.AuthorizeAny()) //nolint:gosec // G123: intentional. A resumed connection reuses the access control decision from its original full handshake; certloader.BindSessionsToGeneration bounds that by invalidating every session on reload.
+	config.GetCertificate = spiffeConfig.GetCertificate(c.source)
 	return config
-}
-
-func (c *spiffeTLSConfig) chainVerifyPeerCertificate(orig func([][]byte, [][]*x509.Certificate) error) func([][]byte, [][]*x509.Certificate) error {
-	return func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-		var certs []*x509.Certificate
-		for _, rawCert := range rawCerts {
-			cert, err := x509.ParseCertificate(rawCert)
-			if err != nil {
-				return err
-			}
-			certs = append(certs, cert)
-		}
-
-		// Grab the current set of roots.
-		roots, err := c.peer.GetRoots()
-		if err != nil {
-			return err
-		}
-
-		// Verify the certificate chain. Allow the remote peer to have any SPIFFE ID as
-		// the authorization check will happen via `orig`.
-		verifiedChains, err := spiffe.VerifyPeerCertificate(certs, roots, spiffe.ExpectAnyPeer())
-		if err != nil {
-			return err
-		}
-		if orig != nil {
-			return orig(rawCerts, verifiedChains)
-		}
-		return nil
-	}
 }

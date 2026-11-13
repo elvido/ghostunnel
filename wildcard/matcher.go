@@ -31,16 +31,21 @@
 // pattern.
 //
 // (2) A double '**' wildcard will match anything, including the separator
-// rune. It may only occur at the end of a pattern, after a separator.
+// rune. It may only occur at the end of a pattern, either after a separator
+// or as the entire pattern (in which case it matches any input).
 //
 // Furthermore, the matcher will consider the separator optional if it occurs
 // at the end of a string. This means that, for example, the strings
-// "test://foo/bar" and "test://foo/bar/" are treated as equivalent.
+// "test://foo/bar" and "test://foo/bar/" are treated as equivalent. The same
+// holds for patterns: a single trailing separator is stripped before
+// compilation, so the patterns "foo" and "foo/" are equivalent and accept the
+// same set of inputs.
 package wildcard
 
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"regexp"
 	"strings"
 )
@@ -106,7 +111,39 @@ func CompileWithSeparator(pattern string, separator rune) (Matcher, error) {
 		return nil, errEmptyPattern
 	}
 
+	// Normalize: strip a single trailing separator so that "foo" and "foo/"
+	// compile to the same regex. This keeps the documented input-side
+	// equivalence ("test://foo/bar" ~ "test://foo/bar/") symmetric on the
+	// pattern side. We don't strip if the pattern is just the separator
+	// itself, as that would leave us with an empty pattern.
+	sepStr := string(separator)
+	if len(pattern) > len(sepStr) && strings.HasSuffix(pattern, sepStr) {
+		pattern = pattern[:len(pattern)-len(sepStr)]
+	}
+
+	// Special case: a bare "**" matches anything. The documented grammar
+	// requires "**" to follow a separator, but historically a bare "**" has
+	// been accepted (and matched everything by accident of regex parsing).
+	// Compile it explicitly so the behavior is intentional rather than
+	// emergent.
+	if pattern == "**" {
+		compiled, err := regexp.Compile("^.*$")
+		if err != nil {
+			return nil, errRegexpCompile
+		}
+		return regexpMatcher{pattern: compiled}, nil
+	}
+
 	segments := strings.Split(pattern, string(separator))
+
+	// Quote the separator so it can be safely emitted into the generated
+	// regular expression. Outside a character class, regexp.QuoteMeta is
+	// sufficient. Inside a [^...] character class, escaping rules differ
+	// (e.g. '-' is special and '\\d', '\\w', '\\s' are parsed as character classes),
+	// so use an explicit Unicode code-point escape, which is safe in RE2
+	// character classes for any rune.
+	sepOutside := regexp.QuoteMeta(string(separator))
+	sepInsideClass := fmt.Sprintf(`\x{%X}`, separator)
 
 	var regex bytes.Buffer
 	regex.WriteString("^")
@@ -117,7 +154,7 @@ loop:
 		case "*":
 			// Segment with wildcard
 			regex.WriteString("[^")
-			regex.WriteRune(separator)
+			regex.WriteString(sepInsideClass)
 			regex.WriteString("]+")
 		case "**":
 			// Segment with double wildcard
@@ -126,7 +163,7 @@ loop:
 				return nil, errInvalidDoubleWildcard
 			}
 			regex.WriteString("?(|")
-			regex.WriteRune(separator)
+			regex.WriteString(sepOutside)
 			regex.WriteString(".*)$")
 			break loop
 		default:
@@ -138,7 +175,7 @@ loop:
 		}
 
 		// Separate this segment from next one
-		regex.WriteRune(separator)
+		regex.WriteString(sepOutside)
 
 		if i == len(segments)-1 {
 			// Final slash should be optional
@@ -159,5 +196,5 @@ loop:
 
 // Matches checks if the given input matches the compiled pattern.
 func (rm regexpMatcher) Matches(input string) bool {
-	return rm.pattern.Match([]byte(input))
+	return rm.pattern.MatchString(input)
 }

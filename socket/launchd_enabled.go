@@ -1,4 +1,4 @@
-// +build darwin
+//go:build darwin && cgo
 
 /*-
  * Copyright 2019 Square Inc.
@@ -33,23 +33,25 @@ import (
 
 func launchdSocket(address string) (net.Listener, error) {
 	c_name := C.CString(address)
+	defer C.free(unsafe.Pointer(c_name))
 	var c_fds *C.int
 	c_cnt := C.size_t(0)
 
 	err := C.launch_activate_socket(c_name, &c_fds, &c_cnt)
 	if err != 0 {
-		return nil, fmt.Errorf("couldn't activate launchd socket: %v", err)
+		return nil, fmt.Errorf("unable to activate launchd socket: %v", err)
 	}
 
 	length := int(c_cnt)
 	if length != 1 {
-		return nil, fmt.Errorf("expected exactly one socket to be configured in launchd for '%s', found %d", address, length)
+		return nil, fmt.Errorf("expected exactly one socket to be configured in launchd for %q, found %d", address, length)
 	}
 	ptr := unsafe.Pointer(c_fds)
 	defer C.free(ptr)
 
 	fds := (*[1]C.int)(ptr)
 	file := os.NewFile(uintptr(fds[0]), "")
+	defer file.Close()
 
 	return net.FileListener(file)
 }

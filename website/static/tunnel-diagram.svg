@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="680" height="100" viewBox="0 0 680 100" role="img" aria-labelledby="tunnel-title">
+  <title id="tunnel-title">curl connects over plaintext to a ghostunnel client, which connects over mutual TLS to a ghostunnel server, which forwards plaintext to the backend</title>
+
+  <!-- curl -->
+  <rect x="4" y="24" width="96" height="52" rx="8" fill="#fbfdfe" stroke="#c5dde3" stroke-width="1"/>
+  <text x="52" y="46" text-anchor="middle" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="13" font-weight="600" fill="#172a3a">curl</text>
+  <text x="52" y="64" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#54717e">:8081</text>
+
+  <!-- plaintext: curl -> client -->
+  <line x1="100" y1="50" x2="163" y2="50" stroke="#8aa6b0" stroke-width="1.5"/>
+  <path d="M172 50l-9-4.5v9z" fill="#8aa6b0"/>
+  <text x="136" y="40" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#54717e">plaintext</text>
+
+  <!-- ghostunnel client -->
+  <rect x="172" y="24" width="132" height="52" rx="8" fill="#0b1d2a" stroke="#0e8a9e" stroke-width="1"/>
+  <text x="238" y="46" text-anchor="middle" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="13" font-weight="600" fill="#f2f8fb">ghostunnel</text>
+  <text x="238" y="64" text-anchor="middle" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="11" fill="#3fc6da">client</text>
+
+  <!-- mTLS: client -> server -->
+  <line x1="304" y1="50" x2="367" y2="50" stroke="#0e8a9e" stroke-width="2"/>
+  <path d="M376 50l-9-4.5v9z" fill="#0e8a9e"/>
+  <text x="340" y="40" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" font-weight="600" fill="#0e8a9e">mTLS</text>
+
+  <!-- ghostunnel server -->
+  <rect x="376" y="24" width="132" height="52" rx="8" fill="#0b1d2a" stroke="#0e8a9e" stroke-width="1"/>
+  <text x="442" y="46" text-anchor="middle" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="13" font-weight="600" fill="#f2f8fb">ghostunnel</text>
+  <text x="442" y="64" text-anchor="middle" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="11" fill="#3fc6da">server</text>
+
+  <!-- plaintext: server -> backend -->
+  <line x1="508" y1="50" x2="571" y2="50" stroke="#8aa6b0" stroke-width="1.5"/>
+  <path d="M580 50l-9-4.5v9z" fill="#8aa6b0"/>
+  <text x="544" y="40" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#54717e">plaintext</text>
+
+  <!-- backend -->
+  <rect x="580" y="24" width="96" height="52" rx="8" fill="#fbfdfe" stroke="#c5dde3" stroke-width="1"/>
+  <text x="628" y="46" text-anchor="middle" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="13" font-weight="600" fill="#172a3a">backend</text>
+  <text x="628" y="64" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#54717e">:8080</text>
+</svg>

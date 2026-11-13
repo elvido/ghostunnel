@@ -18,7 +18,9 @@ package main
 
 import (
 	"crypto/tls"
+	"errors"
 	"fmt"
+	"log"
 	"strings"
 
 	"github.com/ghostunnel/ghostunnel/certloader"
@@ -53,28 +55,49 @@ var cipherSuites = map[string][]uint16{
 }
 
 // Build reloadable certificate
-func buildCertificate(keystorePath, certPath, keyPath, keystorePass, caBundlePath string) (certloader.Certificate, error) {
+func buildCertificate(keystorePath, certPath, keyPath, keystorePass, caBundlePath string, logger *log.Logger) (certloader.Certificate, error) {
 	if hasPKCS11() {
+		logger.Printf("using PKCS#11 module as certificate source")
 		if keystorePath != "" {
-			return buildCertificateFromPKCS11(keystorePath, caBundlePath)
-		} else {
-			return buildCertificateFromPKCS11(certPath, caBundlePath)
+			return buildCertificateFromPKCS11(keystorePath, caBundlePath, logger)
 		}
+		return buildCertificateFromPKCS11(certPath, caBundlePath, logger)
 	}
 	if hasKeychainIdentity() {
-		return certloader.CertificateFromKeychainIdentity(*keychainIdentity, caBundlePath, *keychainRequireToken)
+		logger.Printf("using operating system keychain as certificate source")
+		return certloader.CertificateFromKeychainIdentity(*keychainIdentity, *keychainIssuer, caBundlePath, *keychainRequireToken, logger)
 	}
 	if keyPath != "" && certPath != "" {
+		logger.Printf("using cert/key files on disk as certificate source")
 		return certloader.CertificateFromPEMFiles(certPath, keyPath, caBundlePath)
 	}
 	if keystorePath != "" {
+		logger.Printf("using keystore file on disk as certificate source")
 		return certloader.CertificateFromKeystore(keystorePath, keystorePass, caBundlePath)
 	}
+	logger.Printf("no cert source configured -- running without certificate")
 	return certloader.NoCertificate(caBundlePath)
 }
 
-func buildCertificateFromPKCS11(certificatePath, caBundlePath string) (certloader.Certificate, error) {
-	return certloader.CertificateFromPKCS11Module(certificatePath, caBundlePath, *pkcs11Module, *pkcs11TokenLabel, *pkcs11PIN)
+// Build reloadable certificate for authenticating to an HTTPS proxy. Unlike
+// buildCertificate, only file-based sources are supported; PKCS#11, keychain
+// and SPIFFE credentials are reserved for the target. Without a configured
+// source the result carries only the trust bundle used to verify the proxy.
+func buildProxyCertificate(keystorePath, certPath, keyPath, keystorePass, caBundlePath string, logger *log.Logger) (certloader.Certificate, error) {
+	if keyPath != "" && certPath != "" {
+		logger.Printf("using cert/key files on disk as proxy certificate source")
+		return certloader.CertificateFromPEMFiles(certPath, keyPath, caBundlePath)
+	}
+	if keystorePath != "" {
+		logger.Printf("using keystore file on disk as proxy certificate source")
+		return certloader.CertificateFromKeystore(keystorePath, keystorePass, caBundlePath)
+	}
+	logger.Printf("no proxy cert source configured -- connecting to proxy without client certificate")
+	return certloader.NoCertificate(caBundlePath)
+}
+
+func buildCertificateFromPKCS11(certificatePath, caBundlePath string, logger *log.Logger) (certloader.Certificate, error) {
+	return certloader.CertificateFromPKCS11Module(certificatePath, caBundlePath, *pkcs11Module, *pkcs11TokenLabel, *pkcs11PIN, logger)
 }
 
 func hasPKCS11() bool {
@@ -82,58 +105,149 @@ func hasPKCS11() bool {
 }
 
 func hasKeychainIdentity() bool {
-	return keychainIdentity != nil && *keychainIdentity != ""
+	return (keychainIdentity != nil && *keychainIdentity != "") || (keychainIssuer != nil && *keychainIssuer != "")
 }
 
-// buildConfig builds a generic tls.Config
-func buildConfig(enabledCipherSuites string) (*tls.Config, error) {
-	// List of cipher suite preferences:
-	// * We list ECDSA ahead of RSA to prefer ECDSA for multi-cert setups.
-	// * We list AES-128 ahead of AES-256 for performance reasons.
+// parseTLSVersion converts a TLS version string to the corresponding crypto/tls constant
+func parseTLSVersion(version string) (uint16, error) {
+	switch strings.ToUpper(version) {
+	case "TLS1.2":
+		return tls.VersionTLS12, nil
+	case "TLS1.3":
+		return tls.VersionTLS13, nil
+	default:
+		return 0, fmt.Errorf("%q is not supported (expected TLS1.2 or TLS1.3)", version)
+	}
+}
 
+// resolveCipherSuites parses a comma-separated list of cipher-suite group
+// names (e.g. "AES,CHACHA") and returns the concatenated list of underlying
+// tls cipher-suite IDs. If allowUnsafe is true, names from unsafeCipherSuites
+// are also accepted as a fallback.
+//
+// This helper is the single source of truth shared by validateCipherSuites
+// (early validation at flag-parse time) and buildConfig (used to construct
+// the runtime tls.Config). Keeping the lookup in one place ensures the two
+// call sites cannot drift apart.
+func resolveCipherSuites(spec string, allowUnsafe bool) ([]uint16, error) {
 	suites := []uint16{}
-	for _, suite := range strings.Split(enabledCipherSuites, ",") {
+	for suite := range strings.SplitSeq(spec, ",") {
 		name := strings.TrimSpace(suite)
 		ciphers, ok := cipherSuites[name]
-		if !ok && *allowUnsafeCipherSuites {
+		if !ok && allowUnsafe {
 			ciphers, ok = unsafeCipherSuites[name]
 		}
 		if !ok {
-			return nil, fmt.Errorf("invalid cipher suite '%s' selected", name)
+			return nil, fmt.Errorf("invalid cipher suite %q selected", name)
 		}
 
 		suites = append(suites, ciphers...)
 	}
+	return suites, nil
+}
 
-	return &tls.Config{
-		PreferServerCipherSuites: true,
-		MinVersion:               tls.VersionTLS12,
-		CipherSuites:             suites,
-	}, nil
+// acmeALPNProtocol is the ALPN protocol name reserved for the ACME
+// TLS-ALPN-01 challenge (RFC 8737). It's rejected in --alpn because the proxy
+// treats any connection that negotiates it as a challenge probe and closes it
+// without dialing the backend, so listing it would silently blackhole
+// fully-authenticated connections. When ACME is enabled, certloader advertises
+// it automatically.
+const acmeALPNProtocol = "acme-tls/1"
+
+// maxALPNProtocolLength is the maximum length of a single ALPN protocol name.
+// The ALPN extension encodes each name with a one-byte length prefix (RFC 7301),
+// so anything longer cannot be put on the wire.
+const maxALPNProtocolLength = 255
+
+// parseALPN parses a comma-separated list of ALPN protocol names (e.g.
+// "h2,http/1.1") and returns them in the order given, which is the order of
+// preference. Surrounding whitespace on each entry is trimmed, so
+// "h2, http/1.1" and "h2,http/1.1" are equivalent. An empty spec yields a nil
+// list, leaving tls.Config.NextProtos unset (ALPN disabled).
+//
+// Like resolveCipherSuites, this helper is the single source of truth shared by
+// validateALPN (early validation at flag-parse time) and buildConfig (used to
+// construct the runtime tls.Config), so the two cannot drift apart.
+//
+// Rejecting malformed entries up front matters because the two sides fail very
+// differently at runtime. A client with an empty or over-long NextProtos entry
+// is rejected by crypto/tls on every single handshake ("tls: invalid NextProtos
+// value"), so the process starts fine and then no connection ever works. A
+// server never validates at all: a malformed entry simply never matches what a
+// client offers, so negotiation quietly misbehaves. Failing at startup turns
+// both into an obvious flag error.
+func parseALPN(spec string) ([]string, error) {
+	if spec == "" {
+		return nil, nil
+	}
+
+	protos := []string{}
+	for proto := range strings.SplitSeq(spec, ",") {
+		name := strings.TrimSpace(proto)
+		if name == "" {
+			return nil, errors.New("--alpn must not contain empty protocol names")
+		}
+		if len(name) > maxALPNProtocolLength {
+			return nil, fmt.Errorf("--alpn protocol %q is longer than the maximum of %d bytes", name, maxALPNProtocolLength)
+		}
+		if name == acmeALPNProtocol {
+			return nil, fmt.Errorf("--alpn must not contain %q: it is reserved for the ACME TLS-ALPN-01 challenge and is advertised automatically when ACME is in use", acmeALPNProtocol)
+		}
+
+		protos = append(protos, name)
+	}
+	return protos, nil
+}
+
+// buildConfig builds a generic tls.Config
+func buildConfig(enabledCipherSuites string, maxTLSVersion string, allowUnsafe bool, nextProtos string) (*tls.Config, error) {
+	// List of cipher suite preferences:
+	// * We list ECDSA ahead of RSA to prefer ECDSA for multi-cert setups.
+	// * We list AES-128 ahead of AES-256 for performance reasons.
+
+	suites, err := resolveCipherSuites(enabledCipherSuites, allowUnsafe)
+	if err != nil {
+		return nil, err
+	}
+
+	config := &tls.Config{
+		MinVersion:   tls.VersionTLS12,
+		CipherSuites: suites,
+	}
+
+	if maxTLSVersion != "" {
+		maxVer, err := parseTLSVersion(maxTLSVersion)
+		if err != nil {
+			return nil, fmt.Errorf("invalid max TLS version: %w", err)
+		}
+		config.MaxVersion = maxVer
+	}
+
+	protos, err := parseALPN(nextProtos)
+	if err != nil {
+		return nil, err
+	}
+	config.NextProtos = protos
+
+	return config, nil
 }
 
 // buildClientConfig builds a tls.Config for clients
-func buildClientConfig(enabledCipherSuites string) (*tls.Config, error) {
+func buildClientConfig(enabledCipherSuites string, maxTLSVersion string, allowUnsafe bool, nextProtos string) (*tls.Config, error) {
 	// At the moment, we don't apply any extra settings on top of the generic
 	// config for client contexts
-	return buildConfig(enabledCipherSuites)
+	return buildConfig(enabledCipherSuites, maxTLSVersion, allowUnsafe, nextProtos)
 }
 
 // buildServerConfig builds a tls.Config for servers
-func buildServerConfig(enabledCipherSuites string) (*tls.Config, error) {
-	config, err := buildConfig(enabledCipherSuites)
+func buildServerConfig(enabledCipherSuites string, maxTLSVersion string, allowUnsafe bool, nextProtos string) (*tls.Config, error) {
+	config, err := buildConfig(enabledCipherSuites, maxTLSVersion, allowUnsafe, nextProtos)
 	if err != nil {
 		return nil, err
 	}
 
 	// Require client cert by default
 	config.ClientAuth = tls.RequireAndVerifyClientCert
-
-	// P-256/X25519 have an ASM implementation, others do not (at least on x86-64).
-	config.CurvePreferences = []tls.CurveID{
-		tls.X25519,
-		tls.CurveP256,
-	}
 
 	return config, nil
 }

@@ -1,54 +1,60 @@
 #!/usr/bin/env python3
 
-from common import LOCALHOST, RootCert, STATUS_PORT, SocketPair, TcpServer, TlsClient, print_ok, run_ghostunnel, terminate
+from common import LOCALHOST, RootCert, STATUS_PORT, SocketPair, TcpServer, TlsClient, print_ok, run_ghostunnel, require_platform, terminate, LISTEN_PORT, TARGET_PORT
 import time
 import os
 
-if __name__ == "__main__":
-    ghostunnel = None
-    try:
-        # create certs
-        root = RootCert('root')
-        root.create_signed_cert('server')
-        root.create_signed_cert('client')
+require_platform('Darwin', 'Linux', 'BSD')
 
-        # start ghostunnel
-        ghostunnel = run_ghostunnel(['server',
-                                     '--listen={0}:13001'.format(LOCALHOST),
-                                     '--target={0}:13002'.format(LOCALHOST),
-                                     '--keystore=server.p12',
-                                     '--cacert=root.crt',
-                                     '--allow-ou=client',
-                                     '--status={0}:{1}'.format(LOCALHOST,
-                                                               STATUS_PORT)])
+ghostunnel = None
+try:
+    # create certs
+    root = RootCert('root')
+    root.create_signed_cert('server')
+    root.create_signed_cert('client')
 
-        # wait for startup
-        TlsClient(None, 'root', STATUS_PORT).connect(20, 'server')
+    # start ghostunnel
+    ghostunnel = run_ghostunnel(['server',
+                                 '--listen={0}:{1}'.format(LOCALHOST, LISTEN_PORT),
+                                 '--target={0}:{1}'.format(LOCALHOST, TARGET_PORT),
+                                 '--keystore=server.p12',
+                                 '--cacert=root.crt',
+                                 '--allow-ou=client',
+                                 '--status={0}:{1}'.format(LOCALHOST,
+                                                           STATUS_PORT)])
 
-        # create connections with client
-        pair1 = SocketPair(
-            TlsClient('client', 'root', 13001), TcpServer(13002))
-        pair1.validate_can_send_from_client("toto", "pair1 works")
+    # wait for startup
+    TlsClient(None, 'root', STATUS_PORT).connect(20, 'server')
 
-        # shut down ghostunnel with connection open, make sure it doesn't hang
-        print_ok('attempting to terminate ghostunnel via SIGTERM signals')
-        for n in range(0, 90):
-            try:
-                try:
-                    ghostunnel.terminate()
-                    ghostunnel.wait(timeout=1)
-                except BaseException:
-                    pass
-                os.kill(ghostunnel.pid, 0)
-                print_ok("ghostunnel is still alive")
-            except BaseException:
-                stopped = True
-                break
-            time.sleep(1)
+    # create connections with client
+    pair1 = SocketPair(
+        TlsClient('client', 'root', LISTEN_PORT), TcpServer(TARGET_PORT))
+    pair1.validate_can_send_from_client("toto", "pair1 works")
+    pair1.cleanup()
 
-        if not stopped:
-            raise Exception('ghostunnel did not terminate within 90 seconds')
+    print_ok('attempting to terminate ghostunnel via SIGTERM signals')
+    ghostunnel.terminate()
 
-        print_ok("OK (terminated)")
-    finally:
-        terminate(ghostunnel)
+    stopped = False
+    for _ in range(90):
+        try:
+            ghostunnel.wait(timeout=1)
+        except Exception:
+            pass  # wait() may raise if process hasn't exited yet
+        if ghostunnel.poll() is not None:
+            stopped = True
+            break
+        print_ok("ghostunnel is still alive")
+        time.sleep(1)
+
+    if not stopped:
+        raise Exception('ghostunnel did not terminate within 90 seconds')
+
+    if ghostunnel.returncode != 0:
+        raise Exception(
+            'ghostunnel terminated with non-zero exit code: {0}'.format(
+                ghostunnel.returncode))
+
+    print_ok("OK (terminated)")
+finally:
+    terminate(ghostunnel)

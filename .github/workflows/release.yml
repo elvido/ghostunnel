@@ -4,100 +4,162 @@ name: Release
 on:
   push:
     tags: [ "*" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
-  build-unix:
-    name: Build (Unix)
-    strategy:
-      matrix:
-        version: [1.16.x]
-        target: 
-          - { os: 'darwin', platform: 'macos-latest', arch: 'amd64' }
-          - { os: 'linux', platform: 'ubuntu-latest', arch: 'amd64' }
-    runs-on: ${{ matrix.target.platform }}
+  build-linux:
+    name: Build (Linux)
+    runs-on: ubuntu-22.04
     steps:
+      - name: Set up cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - name: Set up toolchain
-        uses: actions/setup-go@v2
+        uses: actions/setup-go@v7
         with:
-          go-version: ${{ matrix.version }}
+          go-version: stable
+          cache: false
         id: go
-      - name: Check out code
-        uses: actions/checkout@v2
       - name: Build binary
-        run: CGO_ENABLED=1 GOARCH=${{ matrix.target.arch }} make ghostunnel
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          go tool mage -compile ./mage-bin
+          CGO_ENABLED=1 GOARCH=amd64 ./mage-bin -v go:build
+          mv ghostunnel ghostunnel-linux-amd64
+          CGO_ENABLED=1 GOARCH=arm64 CC=aarch64-linux-gnu-gcc ./mage-bin -v go:build
+          mv ghostunnel ghostunnel-linux-arm64
       - name: Upload artifact
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v7
         with:
-          name: ghostunnel-${{ matrix.target.os }}-${{ matrix.target.arch }}
-          path: ghostunnel 
+          name: ghostunnel-linux-amd64
+          path: ghostunnel-linux-amd64
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ghostunnel-linux-arm64
+          path: ghostunnel-linux-arm64
+
+  build-darwin:
+    name: Build (MacOS)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Set up toolchain
+        uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache: false
+        id: go
+      - name: Build binary
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          go tool mage -compile ./mage-bin
+          CGO_ENABLED=1 GOARCH=amd64 ./mage-bin -v go:build
+          mv ghostunnel ghostunnel-darwin-amd64
+          CGO_ENABLED=1 GOARCH=arm64 ./mage-bin -v go:build
+          mv ghostunnel ghostunnel-darwin-arm64
+          lipo -create -output ghostunnel-darwin-universal ghostunnel-darwin-amd64 ghostunnel-darwin-arm64
+      - name: Codesign binaries
+        env:
+          CODESIGN_IDENTITY: ${{ secrets.CODESIGN_IDENTITY }}
+          CODESIGN_CERTIFICATE: ${{ secrets.CODESIGN_CERTIFICATE }}
+          CODESIGN_CERTIFICATE_PASSWORD: ${{ secrets.CODESIGN_CERTIFICATE_PASSWORD }}
+        run: |
+          ./mage-bin -v apple:codesign ghostunnel-darwin-amd64
+          ./mage-bin -v apple:codesign ghostunnel-darwin-arm64
+          ./mage-bin -v apple:codesign ghostunnel-darwin-universal
+      - name: Notarize binaries
+        env:
+          NOTARIZE_ISSUER_ID: ${{ secrets.NOTARIZE_ISSUER_ID }}
+          NOTARIZE_KEY_ID: ${{ secrets.NOTARIZE_KEY_ID }}
+          NOTARIZE_KEY: ${{ secrets.NOTARIZE_KEY }}
+        run: |
+          ./mage-bin -v apple:notarize ghostunnel-darwin-amd64
+          ./mage-bin -v apple:notarize ghostunnel-darwin-arm64
+          ./mage-bin -v apple:notarize ghostunnel-darwin-universal
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ghostunnel-darwin-amd64
+          path: ghostunnel-darwin-amd64
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ghostunnel-darwin-arm64
+          path: ghostunnel-darwin-arm64
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ghostunnel-darwin-universal
+          path: ghostunnel-darwin-universal
 
   build-windows:
     name: Build (Windows)
-    strategy:
-      matrix:
-        version: [1.16.x]
-        target: 
-          - { os: 'windows', platform: 'windows-latest', arch: 'amd64' }
-    runs-on: ${{ matrix.target.platform }}
+    runs-on: windows-latest
     steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - name: Set up toolchain
-        uses: actions/setup-go@v2
+        uses: actions/setup-go@v7
         with:
-          go-version: ${{ matrix.version }}
+          go-version: stable
+          cache: false
         id: go
-      - name: Check out code
-        uses: actions/checkout@v2
       - name: Build binary
-        run: make ghostunnel
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          go tool mage -v go:build
+          mv ghostunnel ghostunnel-windows-amd64.exe
       - name: Upload artifact
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v7
         with:
-          name: ghostunnel-${{ matrix.target.os }}-${{ matrix.target.arch }}
-          path: ghostunnel 
+          name: ghostunnel-windows-amd64.exe
+          path: ghostunnel-windows-amd64.exe
 
   release:
     name: Create release
-    runs-on: ubuntu-latest
-    needs: [ build-unix, build-windows ]
-    outputs:
-      upload_url: ${{ steps.create_release.outputs.upload_url }}
+    runs-on: ubuntu-24.04
+    needs: [ build-linux, build-darwin, build-windows ]
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v2
-      - name: Create release
-        id: create_release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Set up Go
+        uses: actions/setup-go@v7
         with:
-          tag_name: ${{ github.ref }}
-          release_name: "Release Build (Draft)"
-          body: "Release Build (from ${{ github.ref }}/${{ github.sha }})"
-          draft: true
-          prerelease: true
-
-  add-assets:
-    name: Add assets
-    runs-on: ubuntu-latest
-    needs: [ build-unix, build-windows, release ]
-    strategy:
-      matrix:
-        target: 
-        - { os: 'darwin', arch: 'amd64' }
-        - { os: 'linux', arch: 'amd64' }
-        - { os: 'windows', arch: 'amd64' }
-    steps:
-      - uses: actions/checkout@v2
-      - name: Download artifact
-        uses: actions/download-artifact@v2
+          go-version: stable
+          cache: false
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
         with:
-          name: ghostunnel-${{ matrix.target.os }}-${{ matrix.target.arch }}
           path: dist
-      - name: Upload artifact to release
-        uses: actions/upload-release-asset@v1
+          merge-multiple: true
+      - name: Install syft
+        uses: anchore/sbom-action/download-syft@v0.24.2
+        with:
+          syft-version: v1.52.0
+      - name: Generate SBOMs
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: go tool mage -v sbom:generate dist
+      - name: Create draft release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.release.outputs.upload_url }}
-          asset_path: ./dist/ghostunnel
-          asset_name: ghostunnel-${{ matrix.target.os }}-${{ matrix.target.arch }}
-          asset_content_type: application/octet-stream
+        run: go tool mage -v github:publish ${{ github.ref_name }}

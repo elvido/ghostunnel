@@ -15,6 +15,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
+	"sync"
+	"sync/atomic"
 	"unsafe"
 )
 
@@ -37,7 +40,7 @@ var (
 type macStore int
 
 // openStore is a function for opening a macStore.
-func openStore() (macStore, error) {
+func openStore(logger *log.Logger) (Store, error) {
 	return macStore(0), nil
 }
 
@@ -53,19 +56,19 @@ func (s macStore) Identities(flags int) ([]Identity, error) {
 	}
 	query := mapToCFDictionary(rawQuery)
 	if query == nilCFDictionaryRef {
-		return nil, errors.New("error creating CFDictionary")
+		return nil, errors.New("unable to create CFDictionary")
 	}
 	defer C.CFRelease(C.CFTypeRef(query))
 
 	var absResult C.CFTypeRef
-	if err := osStatusError(C.SecItemCopyMatching(query, &absResult)); err != nil {
-		if err == errSecItemNotFound {
+	if err := newOSStatusError(C.SecItemCopyMatching(query, &absResult)); err != nil {
+		if errors.Is(err, errSecItemNotFound) {
 			return []Identity{}, nil
 		}
 
 		return nil, err
 	}
-	defer C.CFRelease(C.CFTypeRef(absResult))
+	defer C.CFRelease(absResult)
 
 	// don't need to release aryResult since the abstract result is released above.
 	aryResult := C.CFArrayRef(absResult)
@@ -98,12 +101,12 @@ func (s macStore) Import(data []byte, password string) error {
 		C.CFTypeRef(C.kSecImportExportPassphrase): C.CFTypeRef(cpass),
 	})
 	if cops == nilCFDictionaryRef {
-		return errors.New("error creating CFDictionary")
+		return errors.New("unable to create CFDictionary")
 	}
 	defer C.CFRelease(C.CFTypeRef(cops))
 
 	var cret C.CFArrayRef
-	if err := osStatusError(C.SecPKCS12Import(cdata, cops, &cret)); err != nil {
+	if err := newOSStatusError(C.SecPKCS12Import(cdata, cops, &cret)); err != nil {
 		return err
 	}
 	defer C.CFRelease(C.CFTypeRef(cret))
@@ -111,14 +114,16 @@ func (s macStore) Import(data []byte, password string) error {
 	return nil
 }
 
-// Close implements the Store interface.
+// Close implements the Store interface. No-op on macOS — the system
+// keychain is process-global and does not need to be closed.
 func (s macStore) Close() {}
 
 // macIdentity implements the Identity interface.
 type macIdentity struct {
+	mu    sync.Mutex
 	ref   C.SecIdentityRef
-	kref  C.SecKeyRef
-	cref  C.SecCertificateRef
+	kref  atomic.Uintptr
+	cref  atomic.Uintptr
 	crt   *x509.Certificate
 	chain []*x509.Certificate
 }
@@ -130,6 +135,18 @@ func newMacIdentity(ref C.SecIdentityRef) *macIdentity {
 
 // Certificate implements the Identity interface.
 func (i *macIdentity) Certificate() (*x509.Certificate, error) {
+	// Fast path: already cached.
+	i.mu.Lock()
+	if i.crt != nil {
+		crt := i.crt
+		i.mu.Unlock()
+		return crt, nil
+	}
+	i.mu.Unlock()
+
+	// Do the expensive CGo work outside the lock. getCertRef()/exportCertRef()
+	// must not run while holding i.mu: getCertRef() itself acquires i.mu and
+	// sync.Mutex is not reentrant.
 	certRef, err := i.getCertRef()
 	if err != nil {
 		return nil, err
@@ -140,26 +157,39 @@ func (i *macIdentity) Certificate() (*x509.Certificate, error) {
 		return nil, err
 	}
 
-	i.crt = crt
-
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	// Another goroutine may have populated the cache while we were exporting;
+	// prefer the existing value so all callers observe the same certificate.
+	if i.crt == nil {
+		i.crt = crt
+	}
 	return i.crt, nil
 }
 
 // CertificateChain implements the Identity interface.
 func (i *macIdentity) CertificateChain() ([]*x509.Certificate, error) {
+	// Fast path: already cached.
+	i.mu.Lock()
 	if i.chain != nil {
-		return i.chain, nil
+		chain := i.chain
+		i.mu.Unlock()
+		return chain, nil
 	}
+	i.mu.Unlock()
 
+	// Build the chain outside the lock: it makes CGo/SecTrust calls and
+	// internally calls getCertRef(), which acquires i.mu (non-reentrant).
 	certRef, err := i.getCertRef()
 	if err != nil {
 		return nil, err
 	}
 
 	policy := C.SecPolicyCreateSSL(0, nilCFStringRef)
+	defer C.CFRelease(C.CFTypeRef(policy))
 
 	var trustRef C.SecTrustRef
-	if err := osStatusError(C.SecTrustCreateWithCertificates(C.CFTypeRef(certRef), C.CFTypeRef(policy), &trustRef)); err != nil {
+	if err := newOSStatusError(C.SecTrustCreateWithCertificates(C.CFTypeRef(certRef), C.CFTypeRef(policy), &trustRef)); err != nil {
 		return nil, err
 	}
 	defer C.CFRelease(C.CFTypeRef(trustRef))
@@ -169,15 +199,20 @@ func (i *macIdentity) CertificateChain() ([]*x509.Certificate, error) {
 	// us if the chain isn't trusted by the underlying system.
 	var cerr C.CFErrorRef
 	C.SecTrustEvaluateWithError(trustRef, &cerr)
+	if cerr != nilCFErrorRef {
+		C.CFRelease(C.CFTypeRef(cerr))
+	}
 
 	var (
 		nchain = C.SecTrustGetCertificateCount(trustRef)
 		chain  = make([]*x509.Certificate, 0, int(nchain))
 	)
 
-	for i := C.CFIndex(0); i < nchain; i++ {
-		// TODO: do we need to release these?
-		chainCertref := C.SecTrustGetCertificateAtIndex(trustRef, i)
+	trustChain := C.SecTrustCopyCertificateChain(trustRef)
+	defer C.CFRelease(C.CFTypeRef(trustChain))
+
+	for j := C.CFIndex(0); j < nchain; j++ {
+		chainCertref := (C.SecCertificateRef)(C.CFArrayGetValueAtIndex(trustChain, j))
 		if chainCertref == nilSecCertificateRef {
 			return nil, errors.New("nil certificate in chain")
 		}
@@ -190,9 +225,12 @@ func (i *macIdentity) CertificateChain() ([]*x509.Certificate, error) {
 		chain = append(chain, chainCert)
 	}
 
-	i.chain = chain
-
-	return chain, nil
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if i.chain == nil {
+		i.chain = chain
+	}
+	return i.chain, nil
 }
 
 // Signer implements the Identity interface.
@@ -212,7 +250,7 @@ func (i *macIdentity) Delete() error {
 	itemListPtr := (*unsafe.Pointer)(unsafe.Pointer(&itemList[0]))
 	citemList := C.CFArrayCreate(nilCFAllocatorRef, itemListPtr, 1, nil)
 	if citemList == nilCFArrayRef {
-		return errors.New("error creating CFArray")
+		return errors.New("unable to create CFArray")
 	}
 	defer C.CFRelease(C.CFTypeRef(citemList))
 
@@ -221,11 +259,11 @@ func (i *macIdentity) Delete() error {
 		C.CFTypeRef(C.kSecMatchItemList): C.CFTypeRef(citemList),
 	})
 	if query == nilCFDictionaryRef {
-		return errors.New("error creating CFDictionary")
+		return errors.New("unable to create CFDictionary")
 	}
 	defer C.CFRelease(C.CFTypeRef(query))
 
-	if err := osStatusError(C.SecItemDelete(query)); err != nil {
+	if err := newOSStatusError(C.SecItemDelete(query)); err != nil {
 		return err
 	}
 
@@ -234,19 +272,20 @@ func (i *macIdentity) Delete() error {
 
 // Close implements the Identity interface.
 func (i *macIdentity) Close() {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
 	if i.ref != nilSecIdentityRef {
 		C.CFRelease(C.CFTypeRef(i.ref))
 		i.ref = nilSecIdentityRef
 	}
 
-	if i.kref != nilSecKeyRef {
-		C.CFRelease(C.CFTypeRef(i.kref))
-		i.kref = nilSecKeyRef
+	if kref := C.SecKeyRef(i.kref.Swap(uintptr(nilSecKeyRef))); kref != nilSecKeyRef {
+		C.CFRelease(C.CFTypeRef(kref))
 	}
 
-	if i.cref != nilSecCertificateRef {
-		C.CFRelease(C.CFTypeRef(i.cref))
-		i.cref = nilSecCertificateRef
+	if cref := C.SecCertificateRef(i.cref.Swap(uintptr(nilSecCertificateRef))); cref != nilSecCertificateRef {
+		C.CFRelease(C.CFTypeRef(cref))
 	}
 }
 
@@ -324,7 +363,14 @@ func (i *macIdentity) getAlgo(hash crypto.Hash, opts crypto.SignerOpts) (algo C.
 		return
 	}
 
-	switch crt.PublicKey.(type) {
+	return algoForPublicKey(crt.PublicKey, hash, opts)
+}
+
+// algoForPublicKey maps a public key type and hash to the appropriate
+// SecKeyAlgorithm constant. Extracted from getAlgo so the key-type switch can
+// be unit-tested independently of keychain state.
+func algoForPublicKey(pub crypto.PublicKey, hash crypto.Hash, opts crypto.SignerOpts) (algo C.SecKeyAlgorithm, err error) {
+	switch pub.(type) {
 	case *ecdsa.PublicKey:
 		switch hash {
 		case crypto.SHA1:
@@ -375,43 +421,57 @@ func (i *macIdentity) getAlgo(hash crypto.Hash, opts crypto.SignerOpts) (algo C.
 	return
 }
 
-// getKeyRef gets the SecKeyRef for this identity's pricate key.
+// getKeyRef gets the SecKeyRef for this identity's private key.
 func (i *macIdentity) getKeyRef() (C.SecKeyRef, error) {
-	if i.kref != nilSecKeyRef {
-		return i.kref, nil
+	if kref := C.SecKeyRef(i.kref.Load()); kref != nilSecKeyRef {
+		return kref, nil
+	}
+
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	if kref := C.SecKeyRef(i.kref.Load()); kref != nilSecKeyRef {
+		return kref, nil
 	}
 
 	var keyRef C.SecKeyRef
-	if err := osStatusError(C.SecIdentityCopyPrivateKey(i.ref, &keyRef)); err != nil {
+	if err := newOSStatusError(C.SecIdentityCopyPrivateKey(i.ref, &keyRef)); err != nil {
 		return nilSecKeyRef, err
 	}
 
-	i.kref = keyRef
+	i.kref.Store(uintptr(keyRef))
 
-	return i.kref, nil
+	return keyRef, nil
 }
 
 // getCertRef gets the SecCertificateRef for this identity's certificate.
 func (i *macIdentity) getCertRef() (C.SecCertificateRef, error) {
-	if i.cref != nilSecCertificateRef {
-		return i.cref, nil
+	if cref := C.SecCertificateRef(i.cref.Load()); cref != nilSecCertificateRef {
+		return cref, nil
+	}
+
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	if cref := C.SecCertificateRef(i.cref.Load()); cref != nilSecCertificateRef {
+		return cref, nil
 	}
 
 	var certRef C.SecCertificateRef
-	if err := osStatusError(C.SecIdentityCopyCertificate(i.ref, &certRef)); err != nil {
+	if err := newOSStatusError(C.SecIdentityCopyCertificate(i.ref, &certRef)); err != nil {
 		return nilSecCertificateRef, err
 	}
 
-	i.cref = certRef
+	i.cref.Store(uintptr(certRef))
 
-	return i.cref, nil
+	return certRef, nil
 }
 
 // exportCertRef gets a *x509.Certificate for the given SecCertificateRef.
 func exportCertRef(certRef C.SecCertificateRef) (*x509.Certificate, error) {
 	derRef := C.SecCertificateCopyData(certRef)
 	if derRef == nilCFDataRef {
-		return nil, errors.New("error getting certificate from identity")
+		return nil, errors.New("unable to get certificate from identity")
 	}
 	defer C.CFRelease(C.CFTypeRef(derRef))
 
@@ -442,8 +502,8 @@ func mapToCFDictionary(gomap map[C.CFTypeRef]C.CFTypeRef) C.CFDictionaryRef {
 	)
 
 	for k, v := range gomap {
-		keys = append(keys, unsafe.Pointer(k))
-		values = append(values, unsafe.Pointer(v))
+		keys = append(keys, unsafe.Pointer(k))     //nolint:govet // CGo pointer conversion is safe here
+		values = append(values, unsafe.Pointer(v)) //nolint:govet // CGo pointer conversion is safe here
 	}
 
 	return C.CFDictionaryCreate(nilCFAllocatorRef, &keys[0], &values[0], C.CFIndex(n), nil, nil)
@@ -469,30 +529,30 @@ func bytesToCFData(gobytes []byte) (C.CFDataRef, error) {
 
 	cdata := C.CFDataCreate(nilCFAllocatorRef, cptr, clen)
 	if cdata == nilCFDataRef {
-		return nilCFDataRef, errors.New("error creatin cfdata")
+		return nilCFDataRef, errors.New("unable to create CFData")
 	}
 
 	return cdata, nil
 }
 
-// osStatus wraps a C.OSStatus
-type osStatus C.OSStatus
+// osStatusError wraps a C.OSStatus
+type osStatusError C.OSStatus
 
 const (
-	errSecItemNotFound = osStatus(C.errSecItemNotFound)
+	errSecItemNotFound = osStatusError(C.errSecItemNotFound)
 )
 
-// osStatusError returns an error for an OSStatus unless it is errSecSuccess.
-func osStatusError(s C.OSStatus) error {
+// newOSStatusError returns an error for an OSStatus unless it is errSecSuccess.
+func newOSStatusError(s C.OSStatus) error {
 	if s == C.errSecSuccess {
 		return nil
 	}
 
-	return osStatus(s)
+	return osStatusError(s)
 }
 
 // Error implements the error interface.
-func (s osStatus) Error() string {
+func (s osStatusError) Error() string {
 	return fmt.Sprintf("OSStatus %d", s)
 }
 
@@ -512,7 +572,6 @@ func cfErrorError(cerr C.CFErrorRef) error {
 
 			return fmt.Errorf("CFError %d (%s)", code, str)
 		}
-
 	}
 
 	return fmt.Errorf("CFError %d", code)

@@ -4,43 +4,43 @@
 Spins up a client and tests systemd socket activation.
 """
 
-from common import LOCALHOST, RootCert, STATUS_PORT, SocketPair, TcpClient, TlsServer, print_ok, run_ghostunnel, terminate
-from distutils.spawn import find_executable
+from common import LOCALHOST, RootCert, STATUS_PORT, TcpClient, print_ok, run_ghostunnel, require_platform, terminate, LISTEN_PORT
+from shutil import which
 import sys
 
-if __name__ == "__main__":
-    ghostunnel = None
+require_platform('Linux')
 
-    if not find_executable('systemd-socket-activate'):
-        print_ok('skipping systemd socket activation test, no systemd-socket-activate binary found')
-        sys.exit(0)
+ghostunnel = None
 
-    try:
-        # create certs
-        root = RootCert('root')
-        root.create_signed_cert('client')
+if not which('systemd-socket-activate'):
+    print('no systemd-socket-activate binary found', file=sys.stderr)
+    sys.exit(2)
 
-        # start ghostunnel
-        ghostunnel = run_ghostunnel([
-                'client',
-                '--listen=systemd:client',
-                '--target={0}:{1}'.format(LOCALHOST, STATUS_PORT),
-                '--keystore=client.p12',
-                '--status=systemd:status',
-                '--cacert=root.crt'],
-                prefix=[
-                'systemd-socket-activate',
-                '--listen={0}:13001'.format(LOCALHOST),
-                '--listen={0}:{1}'.format(LOCALHOST, STATUS_PORT),
-                '--fdname=client:status',
-                '-E=GHOSTUNNEL_INTEGRATION_TEST',
-                '-E=GHOSTUNNEL_INTEGRATION_ARGS',
-                ])
+try:
+    # create certs
+    root = RootCert('root')
+    root.create_signed_cert('client')
 
-        # Connect on status port to trigger socket activation
-        # so it will spin up the ghostunnel instance
-        TcpClient(STATUS_PORT).connect(20)
+    # start ghostunnel
+    ghostunnel = run_ghostunnel([
+            'client',
+            '--listen=systemd:client',
+            '--target={0}:{1}'.format(LOCALHOST, STATUS_PORT),
+            '--keystore=client.p12',
+            '--status=systemd:status',
+            '--cacert=root.crt'],
+            prefix=[
+            'systemd-socket-activate',
+            '--listen={0}:{1}'.format(LOCALHOST, LISTEN_PORT),
+            '--listen={0}:{1}'.format(LOCALHOST, STATUS_PORT),
+            '--fdname=client:status',
+            '--setenv=GOCOVERDIR',
+            ])
 
-        print_ok("OK")
-    finally:
-        terminate(ghostunnel)
+    # Connect on status port to trigger socket activation
+    # so it will spin up the ghostunnel instance
+    TcpClient(STATUS_PORT).connect(20)
+
+    print_ok("OK")
+finally:
+    terminate(ghostunnel)
